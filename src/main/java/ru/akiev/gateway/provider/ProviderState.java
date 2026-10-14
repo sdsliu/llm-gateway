@@ -2,13 +2,12 @@ package ru.akiev.gateway.provider;
 
 import java.time.Duration;
 import java.time.Instant;
-import java.util.ArrayDeque;
-import java.util.Deque;
 import ru.akiev.gateway.config.ProviderProperties;
+import ru.akiev.gateway.usage.LimitTracker;
 
 /**
  * Изменяемое состояние провайдера в runtime: cooldown, остатки лимитов из заголовков,
- * счётчики запросов для собственных лимитов rpm/rpd.
+ * счётчики запросов для собственных лимитов rpm/rpd (делегируем в {@link LimitTracker}).
  *
  * <p>Методы synchronized: Spring MVC обслуживает запросы в разных потоках одновременно,
  * а состояние у провайдера одно на всех. Для учебного MVP synchronized проще и надёжнее,
@@ -16,16 +15,16 @@ import ru.akiev.gateway.config.ProviderProperties;
  */
 public class ProviderState {
 
-    private final ProviderProperties.Limits limits;
+    private final LimitTracker limits;
     private Instant cooldownUntil = Instant.EPOCH;
     private String cooldownReason;
     private Long remainingRequests;
     private Long remainingTokens;
-    /** Время отправки запросов за последние сутки (для rpm/rpd). */
-    private final Deque<Instant> sent = new ArrayDeque<>();
+    private String lastError;
+    private Instant lastErrorAt;
 
     public ProviderState(ProviderProperties.Limits limits) {
-        this.limits = limits;
+        this.limits = limits == null ? new LimitTracker(null, null) : new LimitTracker(limits.rpm(), limits.rpd());
     }
 
     /** Можно ли сейчас слать запрос этому провайдеру. */
@@ -33,22 +32,11 @@ public class ProviderState {
         if (now.isBefore(cooldownUntil)) {
             return false;
         }
-        prune(now);
-        if (limits != null) {
-            if (limits.rpd() != null && limits.rpd() > 0 && sent.size() >= limits.rpd()) {
-                return false;
-            }
-            if (limits.rpm() != null && limits.rpm() > 0
-                    && countSince(now.minus(Duration.ofMinutes(1))) >= limits.rpm()) {
-                return false;
-            }
-        }
-        return true;
+        return limits.allows(now);
     }
 
     public synchronized void recordRequest(Instant now) {
-        sent.addLast(now);
-        prune(now);
+        limits.increment(now);
     }
 
     public synchronized void cooldown(Instant until, String reason) {
@@ -83,14 +71,28 @@ public class ProviderState {
         return remainingTokens;
     }
 
-    private void prune(Instant now) {
-        Instant dayAgo = now.minus(Duration.ofDays(1));
-        while (!sent.isEmpty() && sent.peekFirst().isBefore(dayAgo)) {
-            sent.pollFirst();
-        }
+    public LimitTracker limits() {
+        return limits;
     }
 
-    private long countSince(Instant from) {
-        return sent.stream().filter(t -> !t.isBefore(from)).count();
+    /** Что сейчас мешает провайдеру: "cooldown", "limit" или null (здоров). */
+    public synchronized String blockedBy(Instant now) {
+        if (now.isBefore(cooldownUntil)) {
+            return "cooldown";
+        }
+        return limits.allows(now) ? null : "limit";
+    }
+
+    public synchronized void recordError(Instant now, String error) {
+        lastError = error;
+        lastErrorAt = now;
+    }
+
+    public synchronized String lastError() {
+        return lastError;
+    }
+
+    public synchronized Instant lastErrorAt() {
+        return lastErrorAt;
     }
 }
