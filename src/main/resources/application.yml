@@ -12,7 +12,7 @@ gateway:
     name: groq
     base-url: https://api.groq.com/openai/v1
     api-key: ${GROQ_API_KEY:}
-    model: llama-3.3-70b-versatile
+    model: openai/gpt-oss-120b
     timeout: 120s
 
 management:
