@@ -5,6 +5,8 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Iterator;
+import java.util.stream.Stream;
 import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -92,4 +94,58 @@ public class ProviderRouter {
         throw new AllProvidersUnavailableException(
                 "All providers are unavailable" + (failures.isEmpty() ? "" : " (" + String.join(", ", failures) + ")"));
     }
+
+    /**
+     * Стриминг с failover ТОЛЬКО ДО ПЕРВОГО ЧАНКА.
+     *
+     * <p>Почему так: как только клиенту ушёл первый чанк, HTTP-ответ уже начат (статус 200 и
+     * заголовки отправлены), а клиент начал собирать текст. Переключиться на другого провайдера
+     * «посередине» нельзя: новый провайдер начнёт ответ с начала и с другим содержанием —
+     * клиент получит склейку двух разных ответов. Поэтому:
+     * <ul>
+     *   <li>ошибка до первого чанка (429, 5xx, таймаут соединения) — cooldown и следующий провайдер,
+     *       клиент ничего не замечает; если все упали — честный HTTP 503;</li>
+     *   <li>ошибка после первого чанка — клиенту отправляется error-чанк, поток закрывается.</li>
+     * </ul>
+     *
+     * <p>Как ждём первый чанк: {@code flux.toStream(prefetch)} — блокирующий мост из Flux в обычный
+     * Java Stream (аналог block() для потоков). {@code iterator.hasNext()} блокирует поток, пока не
+     * придёт первый элемент или ошибка. prefetch = сколько чанков Reactor запросит заранее —
+     * это и есть ограничение буфера (backpressure).
+     */
+    public StreamSession openStream(ChatRequest request) {
+        List<String> failures = new ArrayList<>();
+        for (LlmProvider p : providers) {
+            if (!p.state().isAvailable(clock.instant())) {
+                failures.add(p.name() + ": unavailable");
+                continue;
+            }
+            log.info("Стрим → провайдер {} (priority {})", p.name(), p.priority());
+            long start = System.nanoTime();
+            Stream<String> stream = p.chatStream(request).toStream(STREAM_PREFETCH);
+            Iterator<String> it = stream.iterator();
+            try {
+                if (!it.hasNext()) {
+                    // Провайдер закрыл поток, не прислав ни одного чанка — считаем сбоем.
+                    throw new ProviderException(502, "Provider " + p.name() + " returned empty stream", null);
+                }
+                String first = it.next();
+                return new StreamSession(p, stream, it, first, start, request.clientWantsStreamUsage(), listener);
+            } catch (ProviderException e) {
+                stream.close();
+                listener.onFailure(p, e, (System.nanoTime() - start) / 1_000_000);
+                if (!e.isRetriable()) {
+                    throw e;
+                }
+                Duration cd = e.retryAfter() != null ? e.retryAfter() : defaultCooldown;
+                p.state().cooldown(clock.instant().plus(cd), "HTTP " + e.status());
+                log.warn("Failover (стрим, до первого чанка): {} ответил {} — cooldown {}", p.name(), e.status(), cd);
+                failures.add(p.name() + ": HTTP " + e.status());
+            }
+        }
+        throw new AllProvidersUnavailableException(
+                "All providers are unavailable" + (failures.isEmpty() ? "" : " (" + String.join(", ", failures) + ")"));
+    }
+
+    private static final int STREAM_PREFETCH = 32;
 }

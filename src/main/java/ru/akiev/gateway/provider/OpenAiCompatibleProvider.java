@@ -7,7 +7,9 @@ import java.util.List;
 import java.util.concurrent.TimeoutException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.reactive.function.client.WebClient;
@@ -15,6 +17,7 @@ import org.springframework.web.reactive.function.client.WebClientResponseExcepti
 import ru.akiev.gateway.config.ProviderProperties;
 import ru.akiev.gateway.dto.ChatRequest;
 import ru.akiev.gateway.dto.ChatResponse;
+import reactor.core.publisher.Flux;
 
 /**
  * Провайдер для любого OpenAI-совместимого API (Groq, Gemini, OpenRouter, OpenAI, vLLM, Ollama...).
@@ -144,6 +147,69 @@ public class OpenAiCompatibleProvider implements LlmProvider {
             }
             throw new ProviderException(502, "Provider " + name() + " call failed: " + e.getMessage(), e);
         }
+    }
+
+    /** Тип элемента SSE-потока: событие, у которого data — строка (JSON чанка как есть). */
+    private static final ParameterizedTypeReference<ServerSentEvent<String>> SSE_STRING =
+            new ParameterizedTypeReference<>() { };
+
+    /**
+     * Этап 4: стриминг. Здесь уже НЕТ block() — метод возвращает Flux наружу.
+     *
+     * <p>Flux<T> — поток из 0..N элементов во времени (Mono — 0..1). Каждый SSE-чанк провайдера
+     * становится отдельным элементом Flux по мере прихода из сети.
+     *
+     * <p><b>Backpressure (обратное давление)</b>: подписчик сам говорит, сколько элементов он готов
+     * принять (request(n)). Reactor Netty не читает из сокета больше, чем запрошено, поэтому медленный
+     * клиент шлюза автоматически «притормаживает» чтение от провайдера, а не копит гигабайты в памяти.
+     * У нас потребитель — ChatController, который читает поток через toStream(prefetch) и пишет
+     * в HTTP-ответ: пока клиент не принял очередной чанк, новые сверх prefetch не запрашиваются.
+     */
+    @Override
+    public Flux<String> chatStream(ChatRequest request) {
+        ChatRequest outgoing = request.withStream(props.streamUsage());
+        if (props.model() != null && !props.model().isBlank()) {
+            outgoing = outgoing.withModel(props.model());
+        }
+        ChatRequest body = outgoing;
+        // Flux.defer — ничего не делаем до подписки (в том числе не считаем запрос в лимитах).
+        return Flux.defer(() -> {
+            state.recordRequest(clock.instant());
+            return webClient.post()
+                    .uri("/chat/completions")
+                    .accept(MediaType.TEXT_EVENT_STREAM)
+                    .bodyValue(body)
+                    .retrieve()
+                    // toEntityFlux: Mono<ResponseEntity<Flux<T>>> — сначала приходят статус и
+                    // заголовки (читаем x-ratelimit-*), а тело остаётся потоком.
+                    .toEntityFlux(SSE_STRING)
+                    .flatMapMany(entity -> {
+                        updateLimits(entity.getHeaders());
+                        return entity.getBody() != null ? entity.getBody() : Flux.<ServerSentEvent<String>>empty();
+                    })
+                    .map(ServerSentEvent::data)
+                    .filter(d -> d != null && !d.isBlank())
+                    // [DONE] — маркер конца у OpenAI. Дальше читать нечего; сам маркер наружу
+                    // не отдаём — его допишет контроллер (так [DONE] будет ровно один раз).
+                    .takeWhile(d -> !"[DONE]".equals(d.trim()))
+                    // Для Flux timeout — это максимальная пауза МЕЖДУ элементами (и до первого).
+                    // Генерация длинного ответа может идти минуты — это нормально, пока чанки идут.
+                    .timeout(timeout);
+        }).onErrorMap(e -> !(e instanceof ProviderException), this::toProviderException);
+    }
+
+    private ProviderException toProviderException(Throwable e) {
+        if (e instanceof WebClientResponseException w) {
+            updateLimits(w.getHeaders());
+            return new ProviderException(w.getStatusCode().value(),
+                    "Provider " + name() + " returned " + w.getStatusCode().value() + ": "
+                            + w.getResponseBodyAsString(),
+                    RateLimitHeaders.retryAfter(w.getHeaders(), clock.instant()), w);
+        }
+        if (hasCause(e, TimeoutException.class)) {
+            return new ProviderException(504, "Provider " + name() + " stream timed out after " + timeout, e);
+        }
+        return new ProviderException(502, "Provider " + name() + " stream failed: " + e.getMessage(), e);
     }
 
     /**

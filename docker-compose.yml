@@ -1,18 +1,48 @@
-# Локальный PostgreSQL для шлюза: docker compose up -d
+# Локальный запуск: шлюз + PostgreSQL 16.
+#   cp .env.example .env   # вписать ключи
+#   docker compose up -d --build
+#   curl localhost:4000/actuator/health
+# Только база (для ./mvnw spring-boot:run на хосте): docker compose up -d postgres
 services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_DB: gateway
-      POSTGRES_USER: gateway
-      POSTGRES_PASSWORD: gateway
+      POSTGRES_DB: ${DB_NAME:-gateway}
+      POSTGRES_USER: ${DB_USER:-gateway}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-gateway}
     ports:
-      - "5432:5432"
+      - "${DB_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U gateway"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
+      timeout: 3s
       retries: 10
+    restart: unless-stopped
+
+  gateway:
+    build: .
+    image: llm-gateway:local
+    depends_on:
+      postgres:
+        condition: service_healthy   # ждём готовности БД, потом Flyway накатит миграции
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/${DB_NAME:-gateway}
+      DB_USER: ${DB_USER:-gateway}
+      DB_PASSWORD: ${DB_PASSWORD:-gateway}
+    ports:
+      - "${GATEWAY_PORT:-4000}:4000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:4000/actuator/health"]
+      interval: 10s
+      timeout: 3s
+      start_period: 40s
+      retries: 5
+    restart: unless-stopped
+
 volumes:
   pgdata:

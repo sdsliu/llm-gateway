@@ -10,6 +10,9 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  *
  * @param priority чем МЕНЬШЕ число, тем выше приоритет (1 — пробуем первым)
  * @param limits   собственные лимиты шлюза (rpm/rpd), 0 или null = без ограничения
+ * @param streamUsage слать ли провайдеру stream_options.include_usage в режиме stream
+ *                    (Groq, OpenAI, OpenRouter, Gemini поддерживают; для «самописных» серверов
+ *                    можно выключить, если они отвечают 400 на неизвестное поле)
  */
 public record ProviderProperties(
         @NotBlank String name,
@@ -18,7 +21,8 @@ public record ProviderProperties(
         @NotBlank String model,
         @DefaultValue("100") int priority,
         @DefaultValue("120s") Duration timeout,
-        @Valid Limits limits) {
+        @Valid Limits limits,
+        @DefaultValue("true") boolean streamUsage) {
 
     public record Limits(Integer rpm, Integer rpd) {
     }

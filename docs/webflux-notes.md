@@ -96,3 +96,35 @@
   ```
 - SSE, а не WebSocket: данные идут только сервер → браузер, `EventSource` сам переподключается, это обычный HTTP без доп. зависимостей.
 - На этапе 4 то же самое в WebFlux: `Flux<ServerSentEvent<StatusSnapshot>>`, а рассылку удобно делать через `Sinks.many().multicast()`. Стриминг ответов LLM (`stream: true`) — тот же `text/event-stream`.
+
+## 8. Этап 4: стриминг `stream: true`
+
+Что получилось (без перехода всего приложения на WebFlux — сервер по-прежнему MVC):
+
+```
+клиент ──POST stream:true──► ChatController
+            ProviderRouter.openStream()      ← failover здесь, пока ничего не отправлено
+              provider.chatStream(req)       → Flux<String> (WebClient, без block())
+                .toStream(32).iterator()     ← блокирующий мост, ждём ПЕРВЫЙ чанк
+            StreamingResponseBody            ← отдельный async-поток пишет "data: ...\n\n" + flush
+              ... data: [DONE]
+```
+
+### Flux
+- `bodyToFlux` / `toEntityFlux(ServerSentEvent<String>)` — каждый SSE-event провайдера = элемент Flux, приходит по мере генерации текста.
+- `toEntityFlux` даёт сначала статус и заголовки (x-ratelimit-*), а тело остаётся потоком.
+- `takeWhile(!"[DONE]")` — завершаем поток на маркере OpenAI; сам маркер пишет контроллер.
+- `timeout(d)` у Flux — максимальная пауза **между** элементами, а не на весь ответ.
+- `onErrorMap` — превращаем ошибки WebClient в доменную `ProviderException`.
+
+### Backpressure
+Подписчик сообщает, сколько элементов готов принять (`request(n)`). `toStream(32)` запрашивает 32 чанка вперёд и дозапрашивает по мере чтения. Если клиент шлюза читает медленно, `out.write/flush` блокируется → мы не читаем итератор → Reactor не запрашивает новые чанки → Reactor Netty перестаёт читать сокет провайдера. Память не растёт.
+
+### Почему failover только до первого чанка
+После первого `data:` клиенту уже ушли HTTP 200 и начало текста. Другой провайдер сгенерирует *другой* ответ с нуля — склейка была бы бессмысленной. Поэтому до первого чанка — cooldown + следующий провайдер (или 503), после — error-чанк и `[DONE]`.
+
+### Отмена
+Если клиент закрыл соединение, `write` бросает IOException → `session.close()` → `Stream.close()` отменяет подписку → WebClient закрывает соединение с провайдером (токены не тратятся впустую).
+
+### Что будет при полном переходе на WebFlux
+Контроллер вернёт `Flux<ServerSentEvent<String>>` напрямую, мост `toStream` уйдёт, а failover до первого чанка выразится через `switchOnFirst` / `onErrorResume` с флагом «уже начали».

@@ -1,6 +1,7 @@
 package ru.akiev.gateway.provider;
 
 import java.util.List;
+import reactor.core.publisher.Flux;
 import ru.akiev.gateway.dto.ChatRequest;
 import ru.akiev.gateway.dto.ChatResponse;
 
@@ -14,6 +15,13 @@ public interface LlmProvider {
 
     /** Синхронный вызов chat completions (без стриминга). */
     ChatResponse chat(ChatRequest request);
+
+    /**
+     * Стриминговый вызов (stream=true). Возвращает Flux «сырых» JSON-строк чанков
+     * (то, что идёт после "data: " в SSE провайдера), без финального [DONE].
+     * Ошибки HTTP/таймауты приходят как сигнал onError с {@link ProviderException}.
+     */
+    Flux<String> chatStream(ChatRequest request);
 
     /** Модели, которые провайдер отдаёт в /v1/models. */
     List<String> models();

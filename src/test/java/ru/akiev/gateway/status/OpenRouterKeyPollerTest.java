@@ -16,7 +16,7 @@ class OpenRouterKeyPollerTest {
 
     GatewayProperties props(String url, String key) {
         return new GatewayProperties(List.of(new ProviderProperties("openrouter", url, key, "m", 3,
-                Duration.ofSeconds(5), null)), Duration.ofMinutes(5));
+                Duration.ofSeconds(5), null, true)), Duration.ofMinutes(5));
     }
 
     @Test
