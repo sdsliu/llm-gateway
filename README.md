@@ -1,7 +1,7 @@
 # llm-gateway
 
 OpenAI-совместимый LLM-шлюз на Spring Boot 3 / Java 21.
-Этап 3: несколько провайдеров с failover, учёт токенов в PostgreSQL и живой дашборд. Без стриминга.
+Этап 4: несколько провайдеров с failover, учёт токенов в PostgreSQL, живой дашборд, стриминг (`stream: true`) и запуск через Docker Compose.
 
 ## Эндпоинты
 
@@ -11,12 +11,25 @@ OpenAI-совместимый LLM-шлюз на Spring Boot 3 / Java 21.
 
 ## Запуск
 
+### Вариант 1: всё в Docker Compose (шлюз + PostgreSQL 16)
+
 ```bash
-docker compose up -d          # PostgreSQL 16 на localhost:5432 (gateway/gateway)
-# или: docker run -d --name llm-gw-pg -e POSTGRES_DB=gateway -e POSTGRES_USER=gateway \
-#        -e POSTGRES_PASSWORD=gateway -p 5432:5432 postgres:16-alpine
+cp .env.example .env          # вписать GROQ_API_KEY (и при желании GEMINI_/OPENROUTER_API_KEY)
+docker compose up -d --build  # Flyway накатит миграции при старте шлюза
+docker compose ps             # оба сервиса должны быть healthy
+curl localhost:4000/actuator/health
+docker compose down           # остановить (down -v — удалить и данные БД)
+```
+
+Если контейнеры не видят друг друга (ограниченная сеть Docker), используйте host-сеть:
+`docker compose -f docker-compose.yml -f docker-compose.hostnet.yml up -d --build`.
+
+### Вариант 2: шлюз на хосте, база в Docker
+
+```bash
+docker compose up -d postgres
 export GROQ_API_KEY=gsk_...
-./mvnw spring-boot:run        # Flyway сам создаст таблицу usage_record
+./mvnw spring-boot:run
 # шлюз слушает http://localhost:4000
 ```
 
@@ -71,13 +84,24 @@ curl -s http://localhost:4000/v1/models
 curl -s http://localhost:4000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"openai/coder","messages":[{"role":"user","content":"Скажи привет"}]}'
+
+# стриминг (SSE в формате OpenAI, в конце data: [DONE])
+curl -N http://localhost:4000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"openai/coder","stream":true,"messages":[{"role":"user","content":"Перечисли три цвета радуги"}]}'
 ```
+
+Стриминг: failover на другого провайдера возможен только до первого чанка; если поток оборвался
+позже — клиент получит чанк `{"error":...}` и `data: [DONE]`. Usage для учёта запрашивается через
+`stream_options.include_usage` (отключается `stream-usage: false` у провайдера); если провайдер usage
+не прислал, токены в `usage_record` остаются пустыми.
 
 ## Проверка через Aider
 
 ```bash
 export OPENAI_API_KEY=dummy   # ключ шлюзу не нужен, Aider просто требует переменную
-aider --openai-api-base http://localhost:4000/v1 --model openai/coder --no-stream
+aider --openai-api-base http://localhost:4000/v1 --model openai/coder            # со стримингом
+aider --openai-api-base http://localhost:4000/v1 --model openai/coder --no-stream # без стриминга
 ```
 
 ## Изучение WebFlux

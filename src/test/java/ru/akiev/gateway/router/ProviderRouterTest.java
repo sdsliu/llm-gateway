@@ -70,7 +70,7 @@ class ProviderRouterTest {
 
     LlmProvider provider(String name, MockWebServer s, int prio, Duration timeout, ProviderProperties.Limits limits) {
         return new OpenAiCompatibleProvider(WebClient.builder(),
-                new ProviderProperties(name, s.url("/v1").toString(), "k-" + name, "m-" + name, prio, timeout, limits),
+                new ProviderProperties(name, s.url("/v1").toString(), "k-" + name, "m-" + name, prio, timeout, limits, true),
                 clock);
     }
 

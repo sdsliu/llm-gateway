@@ -1,0 +1,11 @@
+# Запасной вариант для сред, где контейнеры в bridge-сети не видят друг друга
+# (так было в нашей песочнице): docker compose -f docker-compose.yml -f docker-compose.hostnet.yml up -d
+services:
+  postgres:
+    network_mode: host
+    ports: !reset []
+  gateway:
+    network_mode: host
+    ports: !reset []
+    environment:
+      DB_URL: jdbc:postgresql://localhost:5432/gateway

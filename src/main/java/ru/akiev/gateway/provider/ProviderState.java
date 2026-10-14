@@ -46,6 +46,12 @@ public class ProviderState {
         cooldownReason = reason;
     }
 
+    /** Снять cooldown вручную (тесты, будущая админка). */
+    public synchronized void resetCooldown() {
+        cooldownUntil = Instant.EPOCH;
+        cooldownReason = null;
+    }
+
     public synchronized void updateRemaining(Long requests, Long tokens) {
         if (requests != null) {
             remainingRequests = requests;
