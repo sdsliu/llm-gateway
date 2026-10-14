@@ -1,7 +1,7 @@
 # llm-gateway
 
 OpenAI-совместимый LLM-шлюз на Spring Boot 3 / Java 21.
-Этап 2: несколько провайдеров с приоритетами и автоматическим failover, без стриминга.
+Этап 3: несколько провайдеров с failover, учёт токенов в PostgreSQL и живой дашборд. Без стриминга.
 
 ## Эндпоинты
 
@@ -12,12 +12,29 @@ OpenAI-совместимый LLM-шлюз на Spring Boot 3 / Java 21.
 ## Запуск
 
 ```bash
+docker compose up -d          # PostgreSQL 16 на localhost:5432 (gateway/gateway)
+# или: docker run -d --name llm-gw-pg -e POSTGRES_DB=gateway -e POSTGRES_USER=gateway \
+#        -e POSTGRES_PASSWORD=gateway -p 5432:5432 postgres:16-alpine
 export GROQ_API_KEY=gsk_...
-./mvnw spring-boot:run
+./mvnw spring-boot:run        # Flyway сам создаст таблицу usage_record
 # шлюз слушает http://localhost:4000
 ```
 
-Тесты: `./mvnw -q test`
+Тесты: `./mvnw -q test` (используют H2 в режиме PostgreSQL, Docker не нужен).
+
+Подключение к БД: `DB_URL`, `DB_USER`, `DB_PASSWORD`.
+
+## Дашборд и статус
+
+- `http://localhost:4000/` — дашборд: карточки провайдеров (работает / cooldown / лимит / пропущен,
+  RPM/RPD, остатки из заголовков), запросы и токены за сегодня, график за 24 часа, последние запросы.
+  Обновляется в реальном времени через SSE, без polling.
+- `GET /status` — тот же срез в JSON (для curl и будущего Telegram-бота).
+- `GET /status/stream` — SSE-поток: `event: snapshot` при подключении, после каждого запроса и при смене
+  состояния провайдера; `event: heartbeat` раз в 15 с.
+- Каждая попытка обращения к провайдеру (включая ошибки и failover) пишется в `usage_record`.
+- Если задан `OPENROUTER_API_KEY`, раз в 5 минут опрашивается `GET /api/v1/key`, остаток кредитов
+  виден в `/status` и на карточке OpenRouter.
 
 Настройки — `src/main/resources/application.yml`, список `gateway.providers`
 (`name`, `base-url`, `api-key`, `model`, `priority`, `timeout`, `limits.rpm/rpd`).

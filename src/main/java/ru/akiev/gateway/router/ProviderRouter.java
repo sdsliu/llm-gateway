@@ -39,8 +39,15 @@ public class ProviderRouter {
     private final List<LlmProvider> providers;
     private final Duration defaultCooldown;
     private final Clock clock;
+    private final RouterListener listener;
 
     public ProviderRouter(List<LlmProvider> providers, Duration defaultCooldown, Clock clock) {
+        this(providers, defaultCooldown, clock, RouterListener.NOOP);
+    }
+
+    public ProviderRouter(List<LlmProvider> providers, Duration defaultCooldown, Clock clock,
+            RouterListener listener) {
+        this.listener = listener;
         this.providers = providers.stream().sorted(Comparator.comparingInt(LlmProvider::priority)).toList();
         this.defaultCooldown = defaultCooldown != null ? defaultCooldown : Duration.ofMinutes(5);
         this.clock = clock;
@@ -62,7 +69,15 @@ public class ProviderRouter {
             }
             try {
                 log.info("Запрос → провайдер {} (priority {})", p.name(), p.priority());
-                return p.chat(request);
+                long start = System.nanoTime();
+                try {
+                    ChatResponse resp = p.chat(request);
+                    listener.onSuccess(p, resp, (System.nanoTime() - start) / 1_000_000);
+                    return resp;
+                } catch (ProviderException e) {
+                    listener.onFailure(p, e, (System.nanoTime() - start) / 1_000_000);
+                    throw e;
+                }
             } catch (ProviderException e) {
                 if (!e.isRetriable()) {
                     throw e;

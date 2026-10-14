@@ -83,3 +83,16 @@
       .switchIfEmpty(Mono.error(new AllProvidersUnavailableException(...)));
   ```
   `concatMap` пробует провайдеров строго по очереди, `next()` берёт первый успешный ответ и отменяет остальное.
+
+## 7. Этап 3: SSE для дашборда
+
+- `GET /status/stream` отдаёт `SseEmitter` (Spring MVC): контроллер возвращает «открытый» ответ, поток Tomcat освобождается, а `StatusBroadcaster` позже вызывает `emitter.send(...)` из любых потоков.
+- Формат на проводе — обычный текст:
+  ```
+  retry:3000
+  event:snapshot
+  data:{"providers":[...]}
+
+  ```
+- SSE, а не WebSocket: данные идут только сервер → браузер, `EventSource` сам переподключается, это обычный HTTP без доп. зависимостей.
+- На этапе 4 то же самое в WebFlux: `Flux<ServerSentEvent<StatusSnapshot>>`, а рассылку удобно делать через `Sinks.many().multicast()`. Стриминг ответов LLM (`stream: true`) — тот же `text/event-stream`.

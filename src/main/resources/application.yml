@@ -6,10 +6,32 @@ spring:
     name: llm-gateway
   jackson:
     default-property-inclusion: non_null
+    serialization:
+      write-dates-as-timestamps: false
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/gateway}
+    username: ${DB_USER:gateway}
+    password: ${DB_PASSWORD:gateway}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: none   # схемой управляет Flyway (src/main/resources/db/migration)
+  flyway:
+    enabled: true
+  mvc:
+    async:
+      request-timeout: -1   # SSE-соединения живут долго; таймаут задаёт сам SseEmitter
 
 gateway:
   # Пауза для провайдера после 429/5xx/таймаута, если он не прислал Retry-After
   default-cooldown: 5m
+  openrouter:
+    name: openrouter        # какой провайдер из списка опрашивать через GET /key
+    poll-interval: PT5M  # ISO-8601
+  status:
+    heartbeat: PT15S         # SSE heartbeat для дашборда
+    state-check: PT1S       # как часто проверять смену состояния провайдеров
+    emitter-timeout: 30m
   # Список провайдеров. priority: меньше = пробуем раньше.
   # Провайдеры с пустым api-key пропускаются при старте.
   # Ключи — только через переменные окружения, в репозиторий не коммитим.

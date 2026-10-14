@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LLM Gateway — дашборд</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="icon" href="data:,">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+</head>
+<body>
+<header>
+  <h1>LLM Gateway</h1>
+  <div id="conn" class="conn off">● подключение…</div>
+</header>
+
+<section class="totals">
+  <div class="total"><span id="t-req">0</span><small>запросов сегодня</small></div>
+  <div class="total"><span id="t-tok">0</span><small>токенов сегодня</small></div>
+  <div class="total"><span id="t-err">0</span><small>ошибок сегодня</small></div>
+  <div class="total"><span id="t-upd">—</span><small>обновлено</small></div>
+</section>
+
+<h2>Провайдеры</h2>
+<section id="providers" class="cards"></section>
+
+<h2>Запросы за 24 часа по часам</h2>
+<section class="chart-box"><canvas id="chart"></canvas></section>
+
+<h2>Последние запросы</h2>
+<table>
+  <thead>
+  <tr><th>Время</th><th>Провайдер</th><th>Модель</th><th>Статус</th><th>Задержка</th>
+    <th>Prompt</th><th>Completion</th><th>Всего</th><th>Ошибка</th></tr>
+  </thead>
+  <tbody id="recent"><tr><td colspan="9" class="muted">Пока нет запросов</td></tr></tbody>
+</table>
+
+<footer>Данные приходят в реальном времени через SSE (<code>/status/stream</code>). JSON: <a href="/status">/status</a></footer>
+<script src="app.js"></script>
+</body>
+</html>

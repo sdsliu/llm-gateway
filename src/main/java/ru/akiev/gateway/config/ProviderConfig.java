@@ -11,6 +11,7 @@ import org.springframework.web.reactive.function.client.WebClient;
 import ru.akiev.gateway.provider.LlmProvider;
 import ru.akiev.gateway.provider.OpenAiCompatibleProvider;
 import ru.akiev.gateway.router.ProviderRouter;
+import ru.akiev.gateway.usage.UsageService;
 
 @Configuration
 public class ProviderConfig {
@@ -29,7 +30,8 @@ public class ProviderConfig {
      * WebClient.Builder Spring Boot создаёт сам (с настроенным Jackson), провайдер делает clone().
      */
     @Bean
-    public ProviderRouter providerRouter(WebClient.Builder builder, GatewayProperties props, Clock clock) {
+    public ProviderRouter providerRouter(WebClient.Builder builder, GatewayProperties props, Clock clock,
+            UsageService usageService) {
         List<LlmProvider> providers = props.providers().stream()
                 .filter(p -> {
                     if (!p.hasApiKey()) {
@@ -42,6 +44,6 @@ public class ProviderConfig {
         if (providers.isEmpty()) {
             log.warn("Нет ни одного провайдера с ключом — все запросы будут получать 503");
         }
-        return new ProviderRouter(providers, props.defaultCooldown(), clock);
+        return new ProviderRouter(providers, props.defaultCooldown(), clock, usageService);
     }
 }
