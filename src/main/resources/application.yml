@@ -1,0 +1,22 @@
+server:
+  port: 4000
+
+spring:
+  application:
+    name: llm-gateway
+  jackson:
+    default-property-inclusion: non_null
+
+gateway:
+  provider:
+    name: groq
+    base-url: https://api.groq.com/openai/v1
+    api-key: ${GROQ_API_KEY:}
+    model: llama-3.3-70b-versatile
+    timeout: 120s
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
