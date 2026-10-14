@@ -7,6 +7,7 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import ru.akiev.gateway.dto.ErrorResponse;
 import ru.akiev.gateway.provider.ProviderException;
+import ru.akiev.gateway.router.AllProvidersUnavailableException;
 
 /** Ошибки в формате OpenAI. */
 @RestControllerAdvice
@@ -30,5 +31,11 @@ public class ApiExceptionHandler {
     public ResponseEntity<ErrorResponse> provider(ProviderException e) {
         return ResponseEntity.status(e.status())
                 .body(ErrorResponse.of(e.getMessage(), "provider_error", String.valueOf(e.status())));
+    }
+
+    @ExceptionHandler(AllProvidersUnavailableException.class)
+    public ResponseEntity<ErrorResponse> allDown(AllProvidersUnavailableException e) {
+        return ResponseEntity.status(503)
+                .body(ErrorResponse.of(e.getMessage(), "service_unavailable", "all_providers_unavailable"));
     }
 }

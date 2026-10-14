@@ -43,7 +43,7 @@ class OpenAiCompatibleProviderTest {
 
     OpenAiCompatibleProvider provider(Duration timeout) {
         var props = new ProviderProperties("groq", server.url("/v1").toString(), "test-key",
-                "llama-3.3-70b-versatile", timeout);
+                "llama-3.3-70b-versatile", 1, timeout, null);
         return new OpenAiCompatibleProvider(WebClient.builder(), props);
     }
 

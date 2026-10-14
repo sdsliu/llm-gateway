@@ -22,6 +22,8 @@ import ru.akiev.gateway.dto.Message;
 import ru.akiev.gateway.dto.Usage;
 import ru.akiev.gateway.provider.LlmProvider;
 import ru.akiev.gateway.provider.ProviderException;
+import ru.akiev.gateway.router.AllProvidersUnavailableException;
+import ru.akiev.gateway.router.ProviderRouter;
 
 @WebMvcTest(ChatController.class)
 class ChatControllerTest {
@@ -30,7 +32,7 @@ class ChatControllerTest {
     MockMvc mvc;
 
     @MockBean
-    LlmProvider provider;
+    ProviderRouter provider;
 
     @Test
     void chatCompletionReturnsProviderResponse() throws Exception {
@@ -71,12 +73,24 @@ class ChatControllerTest {
 
     @Test
     void modelsListed() throws Exception {
-        when(provider.models()).thenReturn(List.of("llama-3.3-70b-versatile"));
-        when(provider.name()).thenReturn("groq");
+        LlmProvider p = org.mockito.Mockito.mock(LlmProvider.class);
+        when(p.models()).thenReturn(List.of("llama-3.3-70b-versatile"));
+        when(p.name()).thenReturn("groq");
+        when(provider.providers()).thenReturn(List.of(p));
         mvc.perform(get("/v1/models"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.object").value("list"))
                 .andExpect(jsonPath("$.data[0].id").value("llama-3.3-70b-versatile"))
                 .andExpect(jsonPath("$.data[0].owned_by").value("groq"));
+    }
+
+    @Test
+    void allProvidersDownGives503() throws Exception {
+        when(provider.chat(any())).thenThrow(new AllProvidersUnavailableException("All providers are unavailable"));
+        mvc.perform(post("/v1/chat/completions").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(jsonPath("$.error.type").value("service_unavailable"))
+                .andExpect(jsonPath("$.error.code").value("all_providers_unavailable"));
     }
 }

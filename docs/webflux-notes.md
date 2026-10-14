@@ -69,3 +69,17 @@
 
 - Spring docs: «WebClient» и «Spring WebFlux».
 - Project Reactor reference: разделы про `Mono`, `Flux`, операторы `map`/`flatMap`/`timeout`/`onErrorResume`.
+
+## 6. Этап 2: что поменялось в WebClient
+
+- Вместо `bodyToMono(ChatResponse.class)` используем `toEntity(ChatResponse.class)` → `Mono<ResponseEntity<ChatResponse>>`. Так видны статус и **заголовки** (`x-ratelimit-remaining-*`), а не только тело.
+- На 4xx/5xx `retrieve()` бросает `WebClientResponseException`; у неё тоже есть `getHeaders()` — оттуда читаем `Retry-After`.
+- Failover сейчас — обычный цикл `for` с `try/catch` в `ProviderRouter`. В реактивной версии (этап 4) это будет цепочка вида
+  ```java
+  Flux.fromIterable(providers)
+      .filter(p -> p.state().isAvailable(now))
+      .concatMap(p -> p.chat(req).onErrorResume(ProviderException.class, e -> { cooldown(p, e); return Mono.empty(); }))
+      .next()
+      .switchIfEmpty(Mono.error(new AllProvidersUnavailableException(...)));
+  ```
+  `concatMap` пробует провайдеров строго по очереди, `next()` берёт первый успешный ответ и отменяет остальное.

@@ -10,28 +10,29 @@ import ru.akiev.gateway.dto.ChatRequest;
 import ru.akiev.gateway.dto.ChatResponse;
 import ru.akiev.gateway.dto.ModelInfo;
 import ru.akiev.gateway.dto.ModelList;
-import ru.akiev.gateway.provider.LlmProvider;
+import ru.akiev.gateway.router.ProviderRouter;
 
 /** OpenAI-совместимые эндпоинты шлюза. */
 @RestController
 @RequestMapping("/v1")
 public class ChatController {
 
-    private final LlmProvider provider;
+    private final ProviderRouter router;
 
-    public ChatController(LlmProvider provider) {
-        this.provider = provider;
+    public ChatController(ProviderRouter router) {
+        this.router = router;
     }
 
     @PostMapping("/chat/completions")
     public ChatResponse chat(@Valid @RequestBody ChatRequest request) {
-        return provider.chat(request);
+        return router.chat(request);
     }
 
     @GetMapping("/models")
     public ModelList models() {
-        return ModelList.of(provider.models().stream()
-                .map(m -> ModelInfo.of(m, provider.name()))
+        return ModelList.of(router.providers().stream()
+                .flatMap(p -> p.models().stream().map(m -> ModelInfo.of(m, p.name())))
+                .distinct()
                 .toList());
     }
 }
