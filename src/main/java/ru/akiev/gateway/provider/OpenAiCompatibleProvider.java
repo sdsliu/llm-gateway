@@ -1,10 +1,15 @@
 package ru.akiev.gateway.provider;
 
+import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.concurrent.TimeoutException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
 import ru.akiev.gateway.config.ProviderProperties;
@@ -12,26 +17,41 @@ import ru.akiev.gateway.dto.ChatRequest;
 import ru.akiev.gateway.dto.ChatResponse;
 
 /**
- * Провайдер для любого OpenAI-совместимого API (Groq, OpenRouter, OpenAI, vLLM, Ollama...).
+ * Провайдер для любого OpenAI-совместимого API (Groq, Gemini, OpenRouter, OpenAI, vLLM, Ollama...).
  *
  * <p>Почему WebClient, а не RestTemplate/RestClient? WebClient — неблокирующий HTTP-клиент
- * из Spring WebFlux. Сейчас (этап 1) мы используем его в «блокирующем» режиме через block(),
+ * из Spring WebFlux. Сейчас мы используем его в «блокирующем» режиме через block(),
  * но код уже написан на реактивном API, и на этапе 4 (стриминг/SSE) переход будет почти
  * механическим: убрать block() и вернуть Mono/Flux наружу. Подробнее — docs/webflux-notes.md.
+ *
+ * <p>Этап 2: провайдер сам НЕ решает, что делать при ошибке — он только читает заголовки
+ * лимитов в {@link ProviderState} и бросает {@link ProviderException} (с Retry-After).
+ * Решение о cooldown и переключении принимает ProviderRouter.
  */
 public class OpenAiCompatibleProvider implements LlmProvider {
+
+    private static final Logger log = LoggerFactory.getLogger(OpenAiCompatibleProvider.class);
 
     private final WebClient webClient;
     private final ProviderProperties props;
     private final Duration timeout;
+    private final ProviderState state;
+    private final Clock clock;
 
     public OpenAiCompatibleProvider(WebClient.Builder builder, ProviderProperties props) {
+        this(builder, props, Clock.systemUTC());
+    }
+
+    public OpenAiCompatibleProvider(WebClient.Builder builder, ProviderProperties props, Clock clock) {
         this.props = props;
+        this.clock = clock;
         this.timeout = props.timeout() != null ? props.timeout() : Duration.ofSeconds(120);
+        this.state = new ProviderState(props.limits());
         // WebClient неизменяемый и потокобезопасный: создаём один раз и переиспользуем.
         // baseUrl — общий префикс (например https://api.groq.com/openai/v1),
         // заголовки по умолчанию добавляются к каждому запросу.
-        // builder.clone() — чтобы не «испортить» общий Spring-овый билдер нашими настройками.
+        // builder.clone() — чтобы не «испортить» общий Spring-овый билдер нашими настройками
+        // (иначе baseUrl одного провайдера «протёк» бы в другого).
         this.webClient = builder.clone()
                 .baseUrl(props.baseUrl())
                 .defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + props.apiKey())
@@ -42,6 +62,16 @@ public class OpenAiCompatibleProvider implements LlmProvider {
     @Override
     public String name() {
         return props.name();
+    }
+
+    @Override
+    public int priority() {
+        return props.priority();
+    }
+
+    @Override
+    public ProviderState state() {
+        return state;
     }
 
     @Override
@@ -57,28 +87,30 @@ public class OpenAiCompatibleProvider implements LlmProvider {
         if (props.model() != null && !props.model().isBlank()) {
             outgoing = outgoing.withModel(props.model());
         }
+        state.recordRequest(clock.instant());
 
         try {
-            return webClient.post()
+            ResponseEntity<ChatResponse> entity = webClient.post()
                     .uri("/chat/completions")
                     .accept(MediaType.APPLICATION_JSON)
                     // bodyValue: объект сериализуется в JSON через Jackson.
                     .bodyValue(outgoing)
-                    // retrieve() — «простой» способ получить тело ответа. Важно: на 4xx/5xx
+                    // retrieve() — «простой» способ получить ответ. Важно: на 4xx/5xx
                     // retrieve() по умолчанию превращает ответ в ошибку
                     // WebClientResponseException (а не возвращает тело как успешное).
                     // Альтернатива — exchangeToMono(), где статус разбираешь вручную.
                     .retrieve()
-                    // bodyToMono(ChatResponse.class) — «когда тело придёт, распарси его
-                    // в ChatResponse». Возвращает Mono<ChatResponse>.
+                    // Этап 1 использовал bodyToMono(ChatResponse.class) — только тело.
+                    // Теперь нам нужны ещё и ЗАГОЛОВКИ (x-ratelimit-*), поэтому берём
+                    // toEntity(...): Mono<ResponseEntity<ChatResponse>> = статус + заголовки + тело.
                     //
                     // Mono<T> — это ОБЕЩАНИЕ 0 или 1 значения в будущем (как CompletableFuture,
                     // но ленивое). До подписки (subscribe/block) НИЧЕГО не происходит:
                     // HTTP-запрос даже не отправлен — мы только описываем конвейер.
-                    .bodyToMono(ChatResponse.class)
+                    .toEntity(ChatResponse.class)
                     // timeout(...) — оператор конвейера: если значение не пришло за указанное
                     // время, Mono завершится ошибкой TimeoutException, а HTTP-запрос будет
-                    // отменён. LLM бывают медленными, поэтому 120 секунд.
+                    // отменён. LLM бывают медленными, поэтому по умолчанию 120 секунд.
                     .timeout(timeout)
                     // block() — подписывается на Mono и БЛОКИРУЕТ текущий поток, пока не
                     // придёт результат или ошибка. В MVP это нормально: контроллер у нас
@@ -89,11 +121,20 @@ public class OpenAiCompatibleProvider implements LlmProvider {
                     // Тогда метод будет возвращать Mono<ChatResponse> / Flux<Chunk> наружу,
                     // а подписку сделает сам фреймворк.
                     .block();
+            if (entity == null) {
+                throw new ProviderException(502, "Provider " + name() + " returned empty response", null);
+            }
+            updateLimits(entity.getHeaders());
+            return entity.getBody();
         } catch (WebClientResponseException e) {
-            // Ошибка HTTP от провайдера: пробрасываем статус и тело клиенту.
+            // Ошибка HTTP от провайдера. Заголовки лимитов приходят и в ответе 429 — читаем их тоже.
+            updateLimits(e.getHeaders());
+            Duration retryAfter = RateLimitHeaders.retryAfter(e.getHeaders(), clock.instant());
             throw new ProviderException(e.getStatusCode().value(),
                     "Provider " + name() + " returned " + e.getStatusCode().value() + ": "
-                            + e.getResponseBodyAsString(), e);
+                            + e.getResponseBodyAsString(), retryAfter, e);
+        } catch (ProviderException e) {
+            throw e;
         } catch (RuntimeException e) {
             // block() «разворачивает» checked-исключения (TimeoutException) в RuntimeException,
             // поэтому ищем причину по цепочке.
@@ -102,6 +143,26 @@ public class OpenAiCompatibleProvider implements LlmProvider {
                         "Provider " + name() + " timed out after " + timeout, e);
             }
             throw new ProviderException(502, "Provider " + name() + " call failed: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Сохраняем остатки лимитов. Если запросов не осталось (remaining = 0) — сразу ставим
+     * cooldown до сброса лимита, чтобы роутер не тратил на этого провайдера следующий запрос.
+     */
+    private void updateLimits(HttpHeaders headers) {
+        Long reqs = RateLimitHeaders.remainingRequests(headers);
+        Long toks = RateLimitHeaders.remainingTokens(headers);
+        state.updateRemaining(reqs, toks);
+        if (reqs != null || toks != null) {
+            log.debug("Провайдер {}: remaining requests={}, tokens={}", name(), reqs, toks);
+        }
+        if (reqs != null && reqs <= 0) {
+            Instant now = clock.instant();
+            Duration reset = RateLimitHeaders.resetRequests(headers, now);
+            Duration wait = reset != null ? reset : Duration.ofMinutes(1);
+            state.cooldown(now.plus(wait), "remaining requests = 0");
+            log.warn("Провайдер {}: лимит запросов исчерпан, пауза {}", name(), wait);
         }
     }
 
