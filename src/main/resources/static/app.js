@@ -47,28 +47,95 @@ function limitRow(label, used, limit) {
           <div class="bar"><i style="width:${pct}%;background:${color}"></i></div>`;
 }
 
+const UNKNOWN = '<span class="muted">неизвестно</span>';
+const dt = iso => iso ? new Date(iso).toLocaleString('ru-RU') : '—';
+
+function headerVal(p, v) {
+  if (v != null) return fmt(v);
+  return p.limits_seen_at ? UNKNOWN : '<span class="muted">неизвестно (провайдер не присылает x-ratelimit-*)</span>';
+}
+
+function pingRow(p) {
+  const r = p.last_ping;
+  if (!r) return `<span>Ping</span><span class="muted">ещё не проверяли</span>`;
+  const cls = r.state === 'up' ? 's-ok' : 's-bad';
+  const txt = r.state === 'up' ? 'доступен' : r.state === 'down' ? 'недоступен' : 'пропущен';
+  return `<span>Ping (${time(r.checked_at)})</span><span class="${cls}">${txt}${r.http_status ? ' · HTTP ' + r.http_status : ''}${r.latency_ms != null ? ' · ' + fmt(r.latency_ms) + ' мс' : ''}${r.models_count != null ? ' · моделей: ' + r.models_count : ''}</span>
+    ${r.error ? `<span>Ошибка ping</span><span class="err" title="${esc(r.error)}">${esc(r.error)}</span>` : ''}`;
+}
+
+function keyRows(k) {
+  if (!k) return '';
+  if (!k.data) return `<span>OpenRouter: кредиты</span><span>${k.error ? esc(k.error) : UNKNOWN}</span>`;
+  const d = k.data;
+  return `<span>OpenRouter: остаток кредитов</span><span>${d.limit == null ? 'без лимита' : esc(d.limit_remaining)}</span>
+    <span>OpenRouter: потрачено / лимит</span><span>${esc(d.usage ?? '—')} / ${d.limit == null ? '∞' : esc(d.limit)}</span>
+    <span>OpenRouter: free tier</span><span>${d.is_free_tier == null ? UNKNOWN : d.is_free_tier ? 'да' : 'нет'}</span>
+    <span>Проверено</span><span>${time(k.fetched_at)}</span>`;
+}
+
 function renderProviders(list) {
   document.getElementById('providers').innerHTML = list.map(p => {
-    const key = p.key_info?.data;
     return `<div class="card ${p.state}">
-      <h3>${esc(p.name)} <span class="badge ${p.state}">${STATE_RU[p.state] ?? p.state}</span></h3>
+      <h3>${esc(p.name)} <span class="badge ${p.state}">${STATE_RU[p.state] ?? p.state}</span>
+        ${p.state !== 'skipped' ? `<button class="btn small" data-ping="${esc(p.name)}">Ping</button>` : ''}</h3>
       <div class="model">${esc(p.model)} · приоритет ${p.priority}</div>
       <div class="kv">
         ${p.state === 'skipped' ? `<span>Причина</span><span>${esc(p.cooldown_reason)}</span>` : `
-        ${limitRow('RPM (минута)', p.rpm_used, p.rpm_limit)}
-        ${limitRow('RPD (сутки)', p.rpd_used, p.rpd_limit)}
-        <span>Остаток запросов (заголовки)</span><span>${p.remaining_requests != null ? fmt(p.remaining_requests) : '—'}</span>
-        <span>Остаток токенов (заголовки)</span><span>${p.remaining_tokens != null ? fmt(p.remaining_tokens) : '—'}</span>
-        <span>Запросов сегодня</span><span>${fmt(p.requests_today)}</span>
-        <span>Токенов сегодня</span><span>${fmt(p.tokens_today)}</span>
-        <span>Ошибок сегодня</span><span>${fmt(p.errors_today)}</span>
-        <span>Средняя задержка</span><span>${p.avg_latency_ms != null ? fmt(p.avg_latency_ms) + ' мс' : '—'}</span>
-        ${key ? `<span>OpenRouter: остаток кредитов</span><span>${key.limit_remaining ?? '∞'}</span>` : ''}`}
+        ${pingRow(p)}
+        <b class="sub">Квота</b>
+        ${limitRow('RPM шлюза (минута)', p.rpm_used, p.rpm_limit)}
+        ${limitRow('RPD шлюза (сутки)', p.rpd_used, p.rpd_limit)}
+        <span>Остаток запросов у провайдера</span><span>${headerVal(p, p.remaining_requests)}</span>
+        <span>Остаток токенов у провайдера</span><span>${headerVal(p, p.remaining_tokens)}</span>
+        <span>Сброс лимита запросов</span><span>${p.reset_requests_at ? time(p.reset_requests_at) : UNKNOWN}</span>
+        <span>Сброс лимита токенов</span><span>${p.reset_tokens_at ? time(p.reset_tokens_at) : UNKNOWN}</span>
+        <span>Заголовки получены</span><span>${p.limits_seen_at ? time(p.limits_seen_at) : '—'}</span>
+        ${keyRows(p.key_info)}
+        <b class="sub">Сегодня</b>
+        <span>Запросов</span><span>${fmt(p.requests_today)}</span>
+        <span>Токенов (usage_record)</span><span>${fmt(p.tokens_today)}</span>
+        <span>Ошибок</span><span>${fmt(p.errors_today)}</span>
+        <span>Средняя задержка</span><span>${p.avg_latency_ms != null ? fmt(p.avg_latency_ms) + ' мс' : '—'}</span>`}
       </div>
       ${p.state === 'cooldown' ? `<div class="note">Пауза до ${time(p.cooldown_until)} (${esc(p.cooldown_reason)})</div>` : ''}
       ${p.last_error ? `<div class="note">Последняя ошибка: ${esc(p.last_error)} в ${time(p.last_error_at)}</div>` : ''}
     </div>`;
   }).join('');
+}
+
+async function post(url) {
+  const r = await fetch(url, { method: 'POST' });
+  return r.json();
+}
+
+document.getElementById('providers').addEventListener('click', async e => {
+  const name = e.target.dataset?.ping;
+  if (!name) return;
+  e.target.disabled = true; e.target.textContent = '…';
+  try { await post(`/status/providers/${encodeURIComponent(name)}/ping`); loadModels(false); } finally { e.target.disabled = false; e.target.textContent = 'Ping'; }
+});
+
+document.getElementById('ping-all').addEventListener('click', async e => {
+  e.target.disabled = true;
+  try { await post('/status/providers/ping'); loadModels(false); } finally { e.target.disabled = false; }
+});
+
+document.getElementById('models-refresh').addEventListener('click', () => loadModels(true));
+
+async function loadModels(refresh) {
+  const box = document.getElementById('models');
+  try {
+    const m = await (await fetch('/status/models' + (refresh ? '?refresh=true' : ''))).json();
+    const gw = m.gateway.map(x => `<li><code>${esc(x.id)}</code> <span class="muted">→ ${esc(x.owned_by)}</span></li>`).join('');
+    const prov = Object.entries(m.providers).map(([name, c]) => `<details><summary><b>${esc(name)}</b>: ${c.models.length} моделей
+        ${c.fetched_at ? `<span class="muted">(загружено ${time(c.fetched_at)})</span>` : ''}${c.error ? ` <span class="err">${esc(c.error)}</span>` : ''}</summary>
+        <ul class="mlist">${c.models.map(id => `<li><code>${esc(id)}</code></li>`).join('')}</ul></details>`).join('');
+    box.innerHTML = `<div><b>Шлюз отдаёт в /v1/models:</b><ul>${gw || '<li class="muted">ничего</li>'}</ul></div>
+      <div><b>Модели у провайдеров (GET /models, кэш):</b>${prov}</div>`;
+  } catch (err) {
+    box.innerHTML = `<span class="err">Не удалось загрузить модели: ${esc(err)}</span>`;
+  }
 }
 
 function renderChart(s) {
@@ -111,3 +178,4 @@ function renderRecent(rows) {
 }
 
 connect();
+loadModels(false);

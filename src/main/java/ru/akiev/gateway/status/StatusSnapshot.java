@@ -38,7 +38,14 @@ public record StatusSnapshot(
             @JsonProperty("avg_latency_ms") Long avgLatencyMs,
             @JsonProperty("last_error") String lastError,
             @JsonProperty("last_error_at") Instant lastErrorAt,
-            @JsonProperty("key_info") KeyInfo keyInfo) {
+            @JsonProperty("key_info") KeyInfo keyInfo,
+            // Когда провайдер обещал сбросить лимиты (x-ratelimit-reset-*), null — не сообщал.
+            @JsonProperty("reset_requests_at") Instant resetRequestsAt,
+            @JsonProperty("reset_tokens_at") Instant resetTokensAt,
+            // Когда последний раз видели заголовки x-ratelimit-* (null — ни разу: остаток неизвестен).
+            @JsonProperty("limits_seen_at") Instant limitsSeenAt,
+            // Результат последнего ping (GET /models), null — ещё не пинговали.
+            @JsonProperty("last_ping") ProviderHealthService.PingResult lastPing) {
     }
 
     /** Данные OpenRouter GET /api/v1/key. */

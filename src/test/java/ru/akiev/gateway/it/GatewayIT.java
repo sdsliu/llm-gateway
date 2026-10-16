@@ -40,7 +40,7 @@ import ru.akiev.gateway.router.ProviderRouter;
  * настоящий PostgreSQL 16 в Docker (Testcontainers, миграции Flyway) и два провайдера на WireMock.
  * Запуск: ./mvnw verify (нужен Docker). Реальные API-ключи не нужны.
  */
-@Testcontainers
+@Testcontainers(disabledWithoutDocker = true)
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class GatewayIT {
 

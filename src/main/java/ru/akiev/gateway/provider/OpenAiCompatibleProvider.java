@@ -221,6 +221,10 @@ public class OpenAiCompatibleProvider implements LlmProvider {
         Long toks = RateLimitHeaders.remainingTokens(headers);
         state.updateRemaining(reqs, toks);
         if (reqs != null || toks != null) {
+            Instant now = clock.instant();
+            Duration rr = RateLimitHeaders.resetRequests(headers, now);
+            Duration rt = RateLimitHeaders.resetTokens(headers);
+            state.updateResets(now, rr != null ? now.plus(rr) : null, rt != null ? now.plus(rt) : null);
             log.debug("Провайдер {}: remaining requests={}, tokens={}", name(), reqs, toks);
         }
         if (reqs != null && reqs <= 0) {

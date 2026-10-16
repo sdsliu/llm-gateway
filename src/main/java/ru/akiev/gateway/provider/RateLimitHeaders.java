@@ -49,6 +49,11 @@ public final class RateLimitHeaders {
         return null;
     }
 
+    /** Через сколько восстановится лимит токенов (x-ratelimit-reset-tokens, Groq/OpenAI). */
+    public static Duration resetTokens(HttpHeaders h) {
+        return parseGoDuration(h.getFirst("x-ratelimit-reset-tokens"));
+    }
+
     /** Retry-After: "120" (секунды) или "Wed, 21 Oct 2015 07:28:00 GMT". */
     public static Duration retryAfter(HttpHeaders h, Instant now) {
         String v = h.getFirst(HttpHeaders.RETRY_AFTER);
