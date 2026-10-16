@@ -20,6 +20,9 @@ public class ProviderState {
     private String cooldownReason;
     private Long remainingRequests;
     private Long remainingTokens;
+    private Instant resetRequestsAt;
+    private Instant resetTokensAt;
+    private Instant limitsSeenAt;
     private String lastError;
     private Instant lastErrorAt;
 
@@ -59,6 +62,30 @@ public class ProviderState {
         if (tokens != null) {
             remainingTokens = tokens;
         }
+    }
+
+    /** Запомнить, когда провайдер обещал сбросить лимиты (из x-ratelimit-reset-*), и время ответа. */
+    public synchronized void updateResets(Instant now, Instant requestsAt, Instant tokensAt) {
+        limitsSeenAt = now;
+        if (requestsAt != null) {
+            resetRequestsAt = requestsAt;
+        }
+        if (tokensAt != null) {
+            resetTokensAt = tokensAt;
+        }
+    }
+
+    public synchronized Instant resetRequestsAt() {
+        return resetRequestsAt;
+    }
+
+    public synchronized Instant resetTokensAt() {
+        return resetTokensAt;
+    }
+
+    /** Когда последний раз пришли заголовки x-ratelimit-* (null — провайдер их не присылал). */
+    public synchronized Instant limitsSeenAt() {
+        return limitsSeenAt;
     }
 
     public synchronized Instant cooldownUntil() {

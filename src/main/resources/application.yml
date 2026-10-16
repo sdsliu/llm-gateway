@@ -28,6 +28,11 @@ gateway:
   openrouter:
     name: openrouter        # какой провайдер из списка опрашивать через GET /key
     poll-interval: PT5M  # ISO-8601
+  health:
+    timeout: PT10S          # таймаут ping (GET {base-url}/models)
+    models-ttl: PT10M       # сколько кэшировать список моделей провайдера
+    scheduled: false        # true — пинговать всех по расписанию
+    interval: PT5M
   status:
     heartbeat: PT15S         # SSE heartbeat для дашборда
     state-check: PT1S       # как часто проверять смену состояния провайдеров

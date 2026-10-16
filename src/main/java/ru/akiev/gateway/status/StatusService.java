@@ -38,11 +38,13 @@ public class StatusService {
     private final GatewayProperties props;
     private final UsageRecordRepository repository;
     private final OpenRouterKeyPoller openRouter;
+    private final ProviderHealthService health;
     private final Clock clock;
     private final ZoneId zone = ZoneId.systemDefault();
 
     public StatusService(ProviderRouter router, GatewayProperties props, UsageRecordRepository repository,
-            OpenRouterKeyPoller openRouter, Clock clock) {
+            OpenRouterKeyPoller openRouter, ProviderHealthService health, Clock clock) {
+        this.health = health;
         this.router = router;
         this.props = props;
         this.repository = repository;
@@ -84,7 +86,9 @@ public class StatusService {
                     s.limits().lastDay(now), s.limits().rpd(),
                     mine.size(), tokens(mine), mine.stream().filter(r -> !r.isSuccess()).count(),
                     mine.isEmpty() ? null : Math.round(mine.stream().mapToLong(UsageRecord::getLatencyMs).average().orElse(0)),
-                    s.lastError(), s.lastErrorAt(), keyInfo(p.name())));
+                    s.lastError(), s.lastErrorAt(), keyInfo(p.name()),
+                    s.resetRequestsAt(), s.resetTokensAt(), s.limitsSeenAt(),
+                    health.lastPing(p.name()).orElse(null)));
         }
         // Провайдеры без ключа тоже показываем — со статусом skipped.
         for (ProviderProperties pp : props.providers()) {
@@ -93,7 +97,7 @@ public class StatusService {
                         null, "api-key не задан", null, null, null,
                         pp.limits() != null ? pp.limits().rpm() : null, null,
                         pp.limits() != null ? pp.limits().rpd() : null,
-                        0, 0, 0, null, null, null, null));
+                        0, 0, 0, null, null, null, null, null, null, null, null));
             }
         }
         providers.sort((a, b) -> Integer.compare(a.priority(), b.priority()));

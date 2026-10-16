@@ -21,11 +21,15 @@
   <div class="total"><span id="t-upd">—</span><small>обновлено</small></div>
 </section>
 
-<h2>Провайдеры</h2>
+<h2>Провайдеры <button id="ping-all" class="btn">Пинговать всех</button></h2>
+<p class="hint">Ping — это <code>GET {base-url}/models</code>: токены не тратит. «неизвестно» значит, что провайдер эти данные не сообщает, мы их не придумываем.</p>
 <section id="providers" class="cards"></section>
 
 <h2>Запросы за 24 часа по часам</h2>
 <section class="chart-box"><canvas id="chart"></canvas></section>
+
+<h2>Модели <button id="models-refresh" class="btn">Обновить</button></h2>
+<section id="models" class="models"><span class="muted">Загрузка…</span></section>
 
 <h2>Последние запросы</h2>
 <table>

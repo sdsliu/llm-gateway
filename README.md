@@ -77,6 +77,32 @@ export GROQ_API_KEY=gsk_...
 ./mvnw spring-boot:run          # http://localhost:4000
 ```
 
+## Дашборд: здоровье, модели, квоты
+
+На `/` для каждого провайдера есть кнопка **Ping** и общая кнопка **«Пинговать всех»**.
+
+| Метод | Путь | Что делает |
+|---|---|---|
+| `POST` | `/status/providers/{name}/ping` | `GET {base-url}/models` с таймаутом → `state` (`up`/`down`/`skipped`), `latency_ms`, `http_status`, `error`, `models_count` |
+| `POST` | `/status/providers/ping` | то же для всех провайдеров параллельно |
+| `GET` | `/status/providers/{name}/models[?refresh=true]` | модели провайдера из его `/models` (кэш `models-ttl`) |
+| `GET` | `/status/models[?refresh=true]` | `gateway` — что отдаёт `/v1/models`, `providers` — модели каждого провайдера |
+
+Ping не тратит токены и не учитывается в RPM/RPD шлюза. Результат последнего ping есть в `GET /status` (`last_ping`).
+Ping по расписанию: `gateway.health.scheduled=true` (интервал `gateway.health.interval`, по умолчанию 5 минут).
+
+**Квота — только то, что реально известно:**
+
+- RPM/RPD шлюза — собственные счётчики `LimitTracker` против `limits` из конфига;
+- `remaining_requests` / `remaining_tokens`, `reset_requests_at` / `reset_tokens_at` — из заголовков
+  `x-ratelimit-*` последнего ответа (Groq присылает всё; OpenRouter — `X-RateLimit-Remaining/Reset`);
+  `limits_seen_at` — когда заголовки пришли в последний раз;
+- токены за сегодня — сумма по `usage_record`;
+- OpenRouter — остаток кредитов ключа (`GET /api/v1/key`).
+
+Если провайдер чего-то не сообщает (например, Gemini не шлёт `x-ratelimit-*`), поле в JSON отсутствует,
+а дашборд пишет **«неизвестно»**. Числа не выдумываются.
+
 ## Переменные окружения
 
 | Переменная | По умолчанию | Назначение |
