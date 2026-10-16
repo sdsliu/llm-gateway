@@ -20,7 +20,7 @@ import ru.akiev.gateway.dto.ChatResponse;
 import reactor.core.publisher.Flux;
 
 /**
- * Провайдер для любого OpenAI-совместимого API (Groq, Gemini, OpenRouter, OpenAI, vLLM, Ollama...).
+ * Провайдер для любого OpenAI-совместимого API (Groq, Z.ai, OpenRouter, OpenAI, vLLM, Ollama...).
  *
  * <p>Почему WebClient, а не RestTemplate/RestClient? WebClient — неблокирующий HTTP-клиент
  * из Spring WebFlux. Сейчас мы используем его в «блокирующем» режиме через block(),

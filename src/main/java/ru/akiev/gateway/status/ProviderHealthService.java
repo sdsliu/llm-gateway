@@ -14,7 +14,9 @@ import java.util.concurrent.TimeoutException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.core.ParameterizedTypeReference;
+import org.springframework.util.unit.DataSize;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.ResponseEntity;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -29,10 +31,16 @@ import ru.akiev.gateway.config.ProviderProperties;
 /**
  * Проверка здоровья провайдеров и список их моделей.
  *
- * <p>Ping — самый дешёвый запрос: {@code GET {base-url}/models}. Он не тратит токены и
- * (у Groq/OpenRouter/Gemini) не считается в лимите chat completions, поэтому мы НЕ учитываем его
+ * <p>Ping — самый дешёвый запрос: {@code GET {base-url}{ping-path}} (по умолчанию /models). Он не тратит токены и
+ * (у Groq/OpenRouter) не считается в лимите chat completions, поэтому мы НЕ учитываем его
  * в LimitTracker. Тот же ответ используем как список моделей провайдера и кэшируем
  * ({@code gateway.health.models-ttl}).
+ *
+ * <p>Состояние «up» определяется только HTTP-статусом: любой 2xx — доступен, даже если тело не
+ * разобралось (модели тогда просто не посчитаны). 404/405 на ping-path тоже «up»: сервер ответил,
+ * но список моделей не поддерживает (например, у Z.ai /models не задокументирован).
+ * Тело читаем строкой с увеличенным лимитом ({@code gateway.health.max-body-size}): ответ
+ * OpenRouter /models больше 1 МБ, а дефолтный лимит WebClient — 256 КБ.
  *
  * <p>Ключ в логи и ответы не попадает: в ошибку пишем только статус и короткое тело.
  */
@@ -40,7 +48,7 @@ import ru.akiev.gateway.config.ProviderProperties;
 public class ProviderHealthService {
 
     private static final Logger log = LoggerFactory.getLogger(ProviderHealthService.class);
-    private static final ParameterizedTypeReference<Map<String, Object>> MAP = new ParameterizedTypeReference<>() { };
+    private static final ObjectMapper JSON = new ObjectMapper();
 
     private final Map<String, ProviderProperties> providers = new LinkedHashMap<>();
     private final Map<String, WebClient> clients = new LinkedHashMap<>();
@@ -54,7 +62,8 @@ public class ProviderHealthService {
     public ProviderHealthService(GatewayProperties props, WebClient.Builder builder, Clock clock,
             @Value("${gateway.health.timeout:PT10S}") Duration timeout,
             @Value("${gateway.health.models-ttl:PT10M}") Duration modelsTtl,
-            @Value("${gateway.health.scheduled:false}") boolean scheduled) {
+            @Value("${gateway.health.scheduled:false}") boolean scheduled,
+            @Value("${gateway.health.max-body-size:16MB}") DataSize maxBodySize) {
         this.clock = clock;
         this.timeout = timeout;
         this.modelsTtl = modelsTtl;
@@ -63,6 +72,7 @@ public class ProviderHealthService {
             providers.put(p.name(), p);
             if (p.hasApiKey()) {
                 clients.put(p.name(), builder.clone().baseUrl(p.baseUrl())
+                        .codecs(c -> c.defaultCodecs().maxInMemorySize((int) maxBodySize.toBytes()))
                         .defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + p.apiKey()).build());
             }
         }
@@ -122,16 +132,23 @@ public class ProviderHealthService {
             return Mono.just(r);
         }
         long start = System.nanoTime();
-        return client.get().uri("/models").retrieve().toEntity(MAP)
+        String path = providers.get(name).pingPath();
+        return client.get().uri(path == null || path.isBlank() ? "/models" : path).retrieve().toEntity(String.class)
                 .timeout(timeout)
                 .map(e -> onSuccess(name, e, start))
                 .onErrorResume(e -> Mono.just(onError(name, e, start)))
                 .doOnNext(r -> lastPing.put(name, r));
     }
 
-    private PingResult onSuccess(String name, ResponseEntity<Map<String, Object>> e, long start) {
+    private PingResult onSuccess(String name, ResponseEntity<String> e, long start) {
         long ms = (System.nanoTime() - start) / 1_000_000;
         List<String> ids = parseIds(e.getBody());
+        if (ids == null) {
+            // 2xx, но тело не похоже на список моделей — провайдер всё равно доступен.
+            models.compute(name, (k, old) -> new ModelsCache(old != null ? old.models() : List.of(),
+                    old != null ? old.fetchedAt() : null, "не удалось разобрать список моделей", clock.instant()));
+            return new PingResult(name, "up", ms, e.getStatusCode().value(), null, clock.instant(), null);
+        }
         models.put(name, new ModelsCache(ids, clock.instant(), null, clock.instant()));
         return new PingResult(name, "up", ms, e.getStatusCode().value(), null, clock.instant(), ids.size());
     }
@@ -140,6 +157,16 @@ public class ProviderHealthService {
         long ms = (System.nanoTime() - start) / 1_000_000;
         Integer status = null;
         String error;
+        if (e instanceof WebClientResponseException w && (w.getStatusCode().is2xxSuccessful()
+                || w.getStatusCode().value() == 404 || w.getStatusCode().value() == 405)) {
+            // 2xx здесь = ошибка чтения/декодирования тела; 404/405 = нет эндпоинта списка моделей.
+            // Сервер ответил и ключ не отвергнут — считаем провайдера доступным.
+            int st = w.getStatusCode().value();
+            String note = st < 300 ? "не удалось прочитать список моделей" : "список моделей не поддерживается (HTTP " + st + ")";
+            models.compute(name, (k, old) -> new ModelsCache(old != null ? old.models() : List.of(),
+                    old != null ? old.fetchedAt() : null, note, clock.instant()));
+            return new PingResult(name, "up", ms, st, null, clock.instant(), null);
+        }
         if (e instanceof WebClientResponseException w) {
             status = w.getStatusCode().value();
             String body = w.getResponseBodyAsString();
@@ -155,14 +182,32 @@ public class ProviderHealthService {
         return new PingResult(name, "down", ms, status, error, clock.instant(), null);
     }
 
-    /** OpenAI-формат: {"data":[{"id":"..."}]}. Gemini OpenAI-compat отдаёт id вида "models/gemini-2.5-flash". */
-    static List<String> parseIds(Map<String, Object> body) {
+    /**
+     * Мягкий разбор списка моделей: {"data":[{"id":...}]} (OpenAI/OpenRouter), голый массив [{"id":...}]
+     * или массив строк. Элемент без id пропускаем. null — если тело вообще не JSON или другой формы.
+     */
+    static List<String> parseIds(String body) {
+        if (body == null || body.isBlank()) {
+            return null;
+        }
+        JsonNode root;
+        try {
+            root = JSON.readTree(body);
+        } catch (Exception e) {
+            return null;
+        }
+        JsonNode arr = root.isArray() ? root : root.path("data");
+        if (!arr.isArray()) {
+            arr = root.path("models");
+        }
+        if (!arr.isArray()) {
+            return null;
+        }
         List<String> ids = new ArrayList<>();
-        if (body != null && body.get("data") instanceof List<?> data) {
-            for (Object o : data) {
-                if (o instanceof Map<?, ?> m && m.get("id") != null) {
-                    ids.add(String.valueOf(m.get("id")));
-                }
+        for (JsonNode n : arr) {
+            JsonNode id = n.isTextual() ? n : n.path("id");
+            if (id.isValueNode() && !id.asText().isBlank()) {
+                ids.add(id.asText());
             }
         }
         ids.sort(String::compareTo);
