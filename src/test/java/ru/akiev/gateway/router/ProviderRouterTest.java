@@ -70,7 +70,7 @@ class ProviderRouterTest {
 
     LlmProvider provider(String name, MockWebServer s, int prio, Duration timeout, ProviderProperties.Limits limits) {
         return new OpenAiCompatibleProvider(WebClient.builder(),
-                new ProviderProperties(name, s.url("/v1").toString(), "k-" + name, "m-" + name, prio, timeout, limits, true),
+                new ProviderProperties(name, s.url("/v1").toString(), "k-" + name, "m-" + name, prio, timeout, limits, true, "/models", null),
                 clock);
     }
 
@@ -187,5 +187,39 @@ class ProviderRouterTest {
         clock.advance(Duration.ofSeconds(61));
         primary.enqueue(json(ok("third")));
         assertThat(answer()).isEqualTo("third");
+    }
+
+    @Test
+    void nonRetriable404IsLoggedAtWarnWithBody() {
+        var logger = (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(ProviderRouter.class);
+        var appender = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            primary.enqueue(new MockResponse().setResponseCode(404)
+                    .setBody("{\"error\":{\"message\":\"Model foo/bar does not exist\",\"code\":404}}"));
+            org.assertj.core.api.Assertions.assertThatThrownBy(this::answer).isInstanceOf(ProviderException.class);
+            var warn = appender.list.stream().filter(e -> e.getLevel() == ch.qos.logback.classic.Level.WARN)
+                    .map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage).findFirst().orElseThrow();
+            assertThat(warn).contains("primary", "404", "does not exist").doesNotContain("k-primary");
+        } finally {
+            logger.detachAppender(appender);
+        }
+    }
+
+    @Test
+    void openRouterNoEndpoints404FailsOverToNextProvider() {
+        primary.enqueue(new MockResponse().setResponseCode(404).setHeader("Content-Type", "application/json")
+                .setBody("{\"error\":{\"message\":\"No endpoints found matching your data policy\",\"code\":404}}"));
+        secondary.enqueue(json(ok("from-secondary")));
+        assertThat(answer()).isEqualTo("from-secondary");
+    }
+
+    @Test
+    void plain404IsNotRetriable() {
+        assertThat(new ProviderException(404, "Provider x returned 404: {\"error\":\"Not Found\"}", null).isRetriable())
+                .isFalse();
+        assertThat(new ProviderException(404, "Provider x returned 404: No endpoints found for m:free.", null).isRetriable())
+                .isTrue();
     }
 }

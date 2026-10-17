@@ -20,7 +20,7 @@ import ru.akiev.gateway.dto.ChatResponse;
 import reactor.core.publisher.Flux;
 
 /**
- * Провайдер для любого OpenAI-совместимого API (Groq, Gemini, OpenRouter, OpenAI, vLLM, Ollama...).
+ * Провайдер для любого OpenAI-совместимого API (Groq, Z.ai, OpenRouter, OpenAI, vLLM, Ollama...).
  *
  * <p>Почему WebClient, а не RestTemplate/RestClient? WebClient — неблокирующий HTTP-клиент
  * из Spring WebFlux. Сейчас мы используем его в «блокирующем» режиме через block(),
@@ -97,7 +97,7 @@ public class OpenAiCompatibleProvider implements LlmProvider {
                     .uri("/chat/completions")
                     .accept(MediaType.APPLICATION_JSON)
                     // bodyValue: объект сериализуется в JSON через Jackson.
-                    .bodyValue(outgoing)
+                    .bodyValue(FallbackModelsBody.of(outgoing, props.fallbackModels()))
                     // retrieve() — «простой» способ получить ответ. Важно: на 4xx/5xx
                     // retrieve() по умолчанию превращает ответ в ошибку
                     // WebClientResponseException (а не возвращает тело как успешное).
@@ -178,7 +178,7 @@ public class OpenAiCompatibleProvider implements LlmProvider {
             return webClient.post()
                     .uri("/chat/completions")
                     .accept(MediaType.TEXT_EVENT_STREAM)
-                    .bodyValue(body)
+                    .bodyValue(FallbackModelsBody.of(body, props.fallbackModels()))
                     .retrieve()
                     // toEntityFlux: Mono<ResponseEntity<Flux<T>>> — сначала приходят статус и
                     // заголовки (читаем x-ratelimit-*), а тело остаётся потоком.

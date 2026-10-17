@@ -34,6 +34,15 @@ public class ProviderException extends RuntimeException {
      * 401/403 тоже считаем поводом переключиться — ключ мог протухнуть.
      */
     public boolean isRetriable() {
-        return status == 429 || status == 401 || status == 403 || status >= 500;
+        return status == 429 || status == 401 || status == 403 || status >= 500 || isNoEndpoints();
+    }
+
+    /**
+     * OpenRouter 404 «No endpoints found ...»: у провайдера сейчас нет живой модели
+     * (free-модель снята, все запасные недоступны, ограничения privacy). У другого провайдера
+     * запрос может пройти — переключаемся.
+     */
+    public boolean isNoEndpoints() {
+        return status == 404 && getMessage() != null && getMessage().contains("No endpoints found");
     }
 }

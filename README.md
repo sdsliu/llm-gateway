@@ -1,7 +1,7 @@
 # llm-gateway
 
 Личный **OpenAI-совместимый LLM-шлюз** на Spring Boot 3 / Java 21. Он принимает запросы в формате
-OpenAI Chat Completions и отправляет их бесплатным или дешёвым провайдерам (Groq, Gemini, OpenRouter и др.).
+OpenAI Chat Completions и отправляет их бесплатным или дешёвым провайдерам (Groq, Z.ai, OpenRouter и др.).
 Провайдеры перебираются по приоритету, а при исчерпании лимитов шлюз автоматически переключается на следующего.
 Каждый запрос записывается в PostgreSQL, а состояние видно на живом веб-дашборде.
 
@@ -30,7 +30,7 @@ flowchart LR
     C[Клиенты<br/>Aider · OpenHands · curl · OpenAI SDK] -->|POST /v1/chat/completions| API[ChatController<br/>api]
     API --> R[ProviderRouter<br/>router]
     R -->|priority 1| G[Groq]
-    R -->|priority 2| GM[Gemini]
+    R -->|priority 2| Z[Z.ai GLM]
     R -->|priority 3| OR[OpenRouter]
     R -. состояние: cooldown, RPM/RPD,<br/>x-ratelimit-* .-> S[(ProviderState<br/>LimitTracker)]
     R -->|RouterListener| U[UsageService<br/>usage]
@@ -100,7 +100,7 @@ Ping по расписанию: `gateway.health.scheduled=true` (интерва�
 - токены за сегодня — сумма по `usage_record`;
 - OpenRouter — остаток кредитов ключа (`GET /api/v1/key`).
 
-Если провайдер чего-то не сообщает (например, Gemini не шлёт `x-ratelimit-*`), поле в JSON отсутствует,
+Если провайдер чего-то не сообщает (например, Z.ai не документирует заголовки `x-ratelimit-*`), поле в JSON отсутствует,
 а дашборд пишет **«неизвестно»**. Числа не выдумываются.
 
 ## Переменные окружения
@@ -108,7 +108,7 @@ Ping по расписанию: `gateway.health.scheduled=true` (интерва�
 | Переменная | По умолчанию | Назначение |
 |---|---|---|
 | `GROQ_API_KEY` | — | ключ Groq (пусто → провайдер пропускается) |
-| `GEMINI_API_KEY` | — | ключ Google AI Studio (OpenAI-совместимый endpoint) |
+| `ZAI_API_KEY` | — | ключ Z.ai (Zhipu GLM), https://z.ai/manage-apikey/apikey-list |
 | `OPENROUTER_API_KEY` | — | ключ OpenRouter; включает опрос `/api/v1/key` |
 | `DB_URL` | `jdbc:postgresql://localhost:5432/gateway` | JDBC URL |
 | `DB_USER` / `DB_PASSWORD` | `gateway` / `gateway` | учётные данные БД |
@@ -151,14 +151,19 @@ gateway:
 | `timeout` | нет (120s) | таймаут запроса |
 | `limits.rpm` / `limits.rpd` | нет | лимиты запросов в минуту/сутки |
 | `stream-usage` | нет (true) | запрашивать usage в стриме |
+| `ping-path` | нет (`/models`) | путь ping дашборда; 404/405 = «доступен, список моделей не поддерживается» |
 
 Провайдеры из коробки:
 
 | Провайдер | base-url | Модель по умолчанию | priority |
 |---|---|---|---|
 | Groq | `https://api.groq.com/openai/v1` | `openai/gpt-oss-120b` | 1 |
-| Gemini | `https://generativelanguage.googleapis.com/v1beta/openai` | `gemini-2.5-flash` | 2 |
-| OpenRouter | `https://openrouter.ai/api/v1` | `meta-llama/llama-3.3-70b-instruct:free` | 3 |
+| Z.ai (GLM) | `https://api.z.ai/api/paas/v4` | `glm-4.7-flash` (бесплатная) | 2 |
+| OpenRouter | `https://openrouter.ai/api/v1` | `nvidia/nemotron-3-super-120b-a12b:free` | 3 |
+
+> OpenRouter: `fallback-models` в конфиге провайдера уходит в тело запроса как нативный параметр OpenRouter `models` ([Model Fallbacks](https://openrouter.ai/docs/guides/routing/model-fallbacks)): если основная модель недоступна или упёрлась в лимит, OpenRouter сам пробует следующие по порядку (сейчас `google/gemma-4-31b-it:free` → `poolside/laguna-s-2.1:free` → `openrouter/free`). Задавайте `fallback-models` только провайдерам, которые понимают поле `models`. Если OpenRouter всё же отвечает 404 «No endpoints found», шлюз переключается на следующего провайдера (как при 429/5xx).
+>
+> OpenRouter: бесплатные модели периодически снимают — тогда OpenRouter отвечает 404 «No endpoints found». Актуальный список: `curl https://openrouter.ai/api/v1/models` (id с `:free`). Тот же 404 бывает, если в https://openrouter.ai/settings/privacy запрещены провайдеры, обучающиеся на запросах (free-модели их требуют).
 
 Подойдёт любой OpenAI-совместимый сервер (OpenAI, Together, vLLM, Ollama `http://localhost:11434/v1` и т. д.):
 достаточно добавить элемент в список.
