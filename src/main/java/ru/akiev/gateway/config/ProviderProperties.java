@@ -3,7 +3,10 @@ package ru.akiev.gateway.config;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import java.time.Duration;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import org.springframework.boot.context.properties.bind.ConstructorBinding;
 import org.springframework.boot.context.properties.bind.DefaultValue;
 
 /**
@@ -19,6 +22,11 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  *                    недоступна. Отправляется в теле как {@code "models": [...]} — это нативный
  *                    параметр OpenRouter (https://openrouter.ai/docs/guides/routing/model-fallbacks).
  *                    Задавайте только для провайдеров, которые его поддерживают; пусто — не отправляем.
+ * @param timeout     таймаут запроса к ЭТОМУ провайдеру (non-stream — весь ответ, stream — пауза до/между
+ *                    чанками). Истёк — 504, cooldown и failover на следующего провайдера.
+ * @param extraBody   дополнительные поля верхнего уровня в теле /chat/completions, специфичные для
+ *                    провайдера (например Z.ai {@code thinking: {type: disabled}}). Поля, которые
+ *                    формирует сам шлюз (model, messages, stream, stream_options, models), не переопределяются.
  */
 public record ProviderProperties(
         @NotBlank String name,
@@ -30,10 +38,20 @@ public record ProviderProperties(
         @Valid Limits limits,
         @DefaultValue("true") boolean streamUsage,
         @DefaultValue("/models") String pingPath,
-        List<String> fallbackModels) {
+        List<String> fallbackModels,
+        Map<String, Object> extraBody) {
 
+    /** Канонический конструктор — по нему Spring Boot биндит application.yml (их у record теперь два). */
+    @ConstructorBinding
     public ProviderProperties {
         fallbackModels = fallbackModels == null ? List.of() : List.copyOf(fallbackModels);
+        extraBody = extraBody == null ? Map.of() : java.util.Collections.unmodifiableMap(new LinkedHashMap<>(extraBody));
+    }
+
+    /** Без extra-body (для кода и тестов, написанных до его появления). */
+    public ProviderProperties(String name, String baseUrl, String apiKey, String model, int priority,
+            Duration timeout, Limits limits, boolean streamUsage, String pingPath, List<String> fallbackModels) {
+        this(name, baseUrl, apiKey, model, priority, timeout, limits, streamUsage, pingPath, fallbackModels, null);
     }
 
     public record Limits(Integer rpm, Integer rpd) {

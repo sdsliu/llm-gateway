@@ -133,6 +133,28 @@ class ProviderRouterTest {
     }
 
     @Test
+    void failoverOn402PaymentRequired() {
+        // SambaNova без карты: 402 PAYMENT_METHOD_REQUIRED — переключаемся, а не отдаём 402 клиенту
+        primary.enqueue(new MockResponse().setResponseCode(402).setHeader("Content-Type", "application/json")
+                .setBody("{\"error\":{\"code\":\"PAYMENT_METHOD_REQUIRED\",\"balance_units\":0}}"));
+        secondary.enqueue(json(ok("from-secondary")));
+        assertThat(answer()).isEqualTo("from-secondary");
+        assertThat(p1.state().cooldownUntil()).isEqualTo(clock.now.plus(Duration.ofMinutes(5)));
+    }
+
+    @Test
+    void perProviderTimeoutTriggersFailoverAndDefaultCooldown() {
+        // как zai с timeout: 20s — медленный провайдер отрезается своим таймаутом, второй с большим отвечает
+        p1 = provider("primary", primary, 1, Duration.ofMillis(300), null);
+        p2 = provider("secondary", secondary, 2, Duration.ofSeconds(5), null);
+        router = new ProviderRouter(List.of(p1, p2), Duration.ofMinutes(5), clock);
+        primary.enqueue(json(ok("slow")).setBodyDelay(2, TimeUnit.SECONDS));
+        secondary.enqueue(json(ok("ok")).setHeadersDelay(500, TimeUnit.MILLISECONDS));
+        assertThat(answer()).isEqualTo("ok");
+        assertThat(p1.state().cooldownUntil()).isEqualTo(clock.now.plus(Duration.ofMinutes(5)));
+    }
+
+    @Test
     void allDownGives503Exception() {
         primary.enqueue(new MockResponse().setResponseCode(429));
         secondary.enqueue(new MockResponse().setResponseCode(500));
