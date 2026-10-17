@@ -27,7 +27,8 @@ public class ProviderConfig {
     }
 
     /**
-     * Создаём по провайдеру на каждый элемент gateway.providers, у которого задан ключ.
+     * Создаём по провайдеру на каждый элемент gateway.providers, у которого задан ключ
+     * (или ключ необязателен: api-key-optional: true).
      * WebClient.Builder Spring Boot создаёт сам (с настроенным Jackson), провайдер делает clone().
      */
     @Bean
@@ -35,15 +36,17 @@ public class ProviderConfig {
             UsageService usageService, RoutingProperties routing) {
         List<LlmProvider> providers = props.providers().stream()
                 .filter(p -> {
-                    if (!p.hasApiKey()) {
+                    if (!p.enabled()) {
                         log.warn("Провайдер {} пропущен: api-key пустой", p.name());
+                    } else if (!p.hasApiKey()) {
+                        log.info("Провайдер {}: api-key не задан, работаем без ключа (keyless)", p.name());
                     }
-                    return p.hasApiKey();
+                    return p.enabled();
                 })
                 .map(p -> (LlmProvider) new OpenAiCompatibleProvider(builder, p, clock))
                 .toList();
         if (providers.isEmpty()) {
-            log.warn("Нет ни одного провайдера с ключом — все запросы будут получать 503");
+            log.warn("Нет ни одного включённого провайдера — все запросы будут получать 503");
         }
         ProviderRouter router = new ProviderRouter(providers, props.defaultCooldown(), clock, usageService);
         router.setRouting(initialRouting(props, routing, router));

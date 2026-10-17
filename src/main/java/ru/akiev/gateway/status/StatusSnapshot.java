@@ -47,7 +47,9 @@ public record StatusSnapshot(
             // Когда последний раз видели заголовки x-ratelimit-* (null — ни разу: остаток неизвестен).
             @JsonProperty("limits_seen_at") Instant limitsSeenAt,
             // Результат последнего ping (GET /models), null — ещё не пинговали.
-            @JsonProperty("last_ping") ProviderHealthService.PingResult lastPing) {
+            @JsonProperty("last_ping") ProviderHealthService.PingResult lastPing,
+            // true — провайдер работает без ключа (api-key-optional и api-key не задан): анонимные лимиты.
+            boolean keyless) {
     }
 
     /** Данные OpenRouter GET /api/v1/key. */

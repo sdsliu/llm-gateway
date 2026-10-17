@@ -37,7 +37,10 @@
   после рестарта снова берётся <code>gateway.routing</code> из application.yml.</p>
 
 <h2>Провайдеры <button id="ping-all" class="btn">Пинговать всех</button></h2>
-<p class="hint">Ping — это <code>GET {base-url}/models</code> (путь настраивается через <code>ping-path</code>): токены не тратит. Любой ответ 2xx = доступен; 404/405 = доступен, но список моделей провайдер не отдаёт. «неизвестно» значит, что провайдер эти данные не сообщает, мы их не придумываем.</p>
+<p class="hint">Ping — это <code>GET {base-url}/models</code> (путь настраивается через <code>ping-path</code>): токены не тратит. Любой ответ 2xx = доступен; 404/405 = доступен, но список моделей провайдер не отдаёт. «неизвестно» значит, что провайдер эти данные не сообщает, мы их не придумываем.
+  «без ключа» — провайдер с <code>api-key-optional: true</code> (Kilo, OVHcloud) работает анонимно: лимиты считаются на IP
+  (Kilo — 200 запросов/час, OVHcloud — 2/мин на модель); задайте <code>KILO_API_KEY</code> / <code>OVH_AI_API_KEY</code>, чтобы их поднять.
+  «пропущен» — не задан обязательный ключ (для Cloudflare — <code>CLOUDFLARE_API_TOKEN</code> и <code>CLOUDFLARE_ACCOUNT_ID</code>).</p>
 <section id="providers" class="cards"></section>
 
 <h2>Запросы за 24 часа по часам</h2>
