@@ -11,6 +11,7 @@ import org.springframework.web.reactive.function.client.WebClient;
 import ru.akiev.gateway.provider.LlmProvider;
 import ru.akiev.gateway.provider.OpenAiCompatibleProvider;
 import ru.akiev.gateway.router.ProviderRouter;
+import ru.akiev.gateway.router.RoutingSettings;
 import ru.akiev.gateway.usage.UsageService;
 
 @Configuration
@@ -31,7 +32,7 @@ public class ProviderConfig {
      */
     @Bean
     public ProviderRouter providerRouter(WebClient.Builder builder, GatewayProperties props, Clock clock,
-            UsageService usageService) {
+            UsageService usageService, RoutingProperties routing) {
         List<LlmProvider> providers = props.providers().stream()
                 .filter(p -> {
                     if (!p.hasApiKey()) {
@@ -44,6 +45,28 @@ public class ProviderConfig {
         if (providers.isEmpty()) {
             log.warn("Нет ни одного провайдера с ключом — все запросы будут получать 503");
         }
-        return new ProviderRouter(providers, props.defaultCooldown(), clock, usageService);
+        ProviderRouter router = new ProviderRouter(providers, props.defaultCooldown(), clock, usageService);
+        router.setRouting(initialRouting(props, routing, router));
+        log.info("Режим роутинга при старте: {}", router.routing());
+        return router;
+    }
+
+    /**
+     * gateway.routing из конфига. Опечатка в primary (такого провайдера нет вообще) — ошибка старта;
+     * провайдер есть, но без api-key — предупреждение, работаем по чистому приоритету.
+     */
+    static RoutingSettings initialRouting(GatewayProperties props, RoutingProperties routing, ProviderRouter router) {
+        RoutingSettings s = new RoutingSettings(routing != null ? routing.mode() : null,
+                routing != null ? routing.primary() : null);
+        if (s.primary() == null || router.names().contains(s.primary())) {
+            return s;
+        }
+        boolean configured = props.providers().stream().anyMatch(p -> p.name().equals(s.primary()));
+        if (!configured) {
+            throw new IllegalStateException("gateway.routing.primary=" + s.primary()
+                    + ": такого провайдера нет в gateway.providers");
+        }
+        log.warn("gateway.routing.primary={} пропущен: у провайдера нет api-key", s.primary());
+        return new RoutingSettings(s.mode(), null);
     }
 }

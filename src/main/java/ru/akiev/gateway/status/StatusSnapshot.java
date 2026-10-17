@@ -14,7 +14,9 @@ public record StatusSnapshot(
         List<ProviderStatus> providers,
         Totals today,
         @JsonProperty("hourly") List<HourBucket> hourly,
-        List<RecentRequest> recent) {
+        List<RecentRequest> recent,
+        // Текущий режим роутинга (PRIORITY / ROUND_ROBIN, primary, порядок перебора).
+        RoutingInfo routing) {
 
     /**
      * @param state healthy | cooldown | limit | skipped (skipped — нет api-key)

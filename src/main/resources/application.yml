@@ -25,6 +25,13 @@ spring:
 gateway:
   # Пауза для провайдера после 429/5xx/таймаута, если он не прислал Retry-After
   default-cooldown: 5m
+  # Режим выбора провайдера (меняется с дашборда / PUT /status/routing, но только в памяти:
+  # после рестарта снова берётся отсюда).
+  #   priority    — по priority; если задан primary, он идёт первым, остальные — по priority;
+  #   round-robin — по кругу среди доступных сейчас (без cooldown/лимита), при ошибке — следующий.
+  routing:
+    mode: priority
+    primary:               # имя провайдера из списка ниже; пусто — чистый приоритет
   openrouter:
     name: openrouter        # какой провайдер из списка опрашивать через GET /key
     poll-interval: PT5M  # ISO-8601

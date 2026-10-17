@@ -20,6 +20,7 @@ OpenAI Chat Completions и отправляет их бесплатным или
 - **Учёт usage**: таблица `usage_record` (Flyway). В неё попадает каждая попытка: провайдер, модель, токены,
   статус и задержка.
 - **Дашборд** на `/`, обновляется в реальном времени через SSE. Есть также JSON `GET /status`.
+- **Режим роутинга** переключается с дашборда: по приоритету (с выбором primary) или round-robin.
 - **OpenRouter**: остаток кредитов ключа проверяется по расписанию (`GET /api/v1/key`).
 - **Docker Compose**: шлюз + PostgreSQL 16 с healthcheck.
 
@@ -246,6 +247,48 @@ print(client.chat.completions.create(model="openai/coder",
   curl -N localhost:4000/status/stream
   ```
 - **`GET /actuator/health`**: healthcheck.
+
+## Режим роутинга (priority / round-robin)
+
+| Режим | Порядок перебора |
+|---|---|
+| `PRIORITY` (по умолчанию) | по `priority`; если задан `primary`, он идёт первым, остальные — по `priority` |
+| `ROUND_ROBIN` | по кругу среди **доступных сейчас** провайдеров (cooldown/лимит пропускаются, без ключа их и так нет); `primary` игнорируется |
+
+В обоих режимах failover одинаковый: при 429/5xx/таймауте провайдер уходит в cooldown, запрос идёт к следующему
+в текущем порядке. Счётчик round-robin — `AtomicLong`, параллельные запросы распределяются равномерно.
+
+Значение по умолчанию — в `application.yml`:
+
+```yaml
+gateway:
+  routing:
+    mode: priority      # priority | round-robin
+    primary:            # имя провайдера; пусто — чистый приоритет
+```
+
+Опечатка в `primary` (такого провайдера нет в `gateway.providers`) — ошибка старта; провайдер без api-key —
+предупреждение в логе и работа по чистому приоритету.
+
+Смена в runtime — блок **«Режим роутинга»** на дашборде (радио-кнопки режима + выпадающий список primary;
+применяется сразу) или REST:
+
+```bash
+curl localhost:4000/status/routing
+# {"mode":"PRIORITY","primary":null,"providers":["groq","sambanova","zai","openrouter"],"order":["groq","sambanova","zai","openrouter"]}
+curl -X PUT localhost:4000/status/routing -H 'Content-Type: application/json' \
+     -d '{"mode":"PRIORITY","primary":"openrouter"}'
+curl -X PUT localhost:4000/status/routing -H 'Content-Type: application/json' -d '{"mode":"ROUND_ROBIN"}'
+```
+
+- `mode` обязателен (`PRIORITY` / `ROUND_ROBIN`, регистр и `-`/`_` не важны); `primary` — имя включённого
+  провайдера (с api-key) или `null`/`""`. Иначе `400` в формате OpenAI (`{"error":{"message":...}}`) и режим не меняется.
+- `order` — порядок, в котором будет перебирать провайдеров следующий запрос.
+- Тот же объект приходит полем `routing` в `GET /status` и в SSE-событии `snapshot`: после `PUT` все открытые
+  дашборды обновляются сразу. Смена режима пишется в лог на уровне INFO.
+- **Режим хранится только в памяти**: после рестарта снова берётся `gateway.routing` из `application.yml`.
+- **Авторизации нет** (как и у всего `/status` и дашборда): `PUT /status/routing` может вызвать любой, кто достучится
+  до порта. Запускайте шлюз локально / в доверенной сети и не публикуйте порт 4000 наружу.
 
 ## Тесты
 

@@ -30,3 +30,7 @@ footer { margin-top:24px; color:var(--muted); font-size:12px; } a { color:#93c5f
 .card h3 .badge { margin-left:8px; } .hint { color:var(--muted); font-size:13px; margin:-6px 0 12px; }
 .models { background:var(--card); border-radius:12px; padding:16px; display:grid; grid-template-columns:1fr 2fr; gap:16px; font-size:14px; }
 .models ul { margin:6px 0; padding-left:20px; } .mlist { max-height:240px; overflow:auto; columns:2; font-size:12px; } details { margin:6px 0; } summary { cursor:pointer; }
+.routing { background:var(--card); border-radius:12px; padding:14px 16px; display:flex; flex-wrap:wrap; align-items:center; gap:12px 24px; font-size:14px; }
+.routing .modes { border:0; margin:0; padding:0; display:flex; gap:16px; } .routing label { cursor:pointer; }
+.routing select { background:#334155; color:var(--text); border:1px solid #475569; border-radius:8px; padding:4px 8px; margin-left:6px; }
+.routing select:disabled { opacity:.5; cursor:not-allowed; } .rt-state { display:flex; gap:12px; flex:1 1 100%; } #rt-msg.ok { color:var(--ok); } #rt-msg.bad { color:var(--bad); }
