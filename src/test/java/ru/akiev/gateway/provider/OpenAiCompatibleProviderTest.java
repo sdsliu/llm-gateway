@@ -43,7 +43,7 @@ class OpenAiCompatibleProviderTest {
 
     OpenAiCompatibleProvider provider(Duration timeout) {
         var props = new ProviderProperties("groq", server.url("/v1").toString(), "test-key",
-                "llama-3.3-70b-versatile", 1, timeout, null, true, "/models");
+                "llama-3.3-70b-versatile", 1, timeout, null, true, "/models", null);
         return new OpenAiCompatibleProvider(WebClient.builder(), props);
     }
 
@@ -88,5 +88,37 @@ class OpenAiCompatibleProviderTest {
         assertThatThrownBy(() -> provider(Duration.ofMillis(300)).chat(request()))
                 .isInstanceOf(ProviderException.class)
                 .satisfies(e -> assertThat(((ProviderException) e).status()).isEqualTo(504));
+    }
+
+    OpenAiCompatibleProvider openRouter(List<String> fallbacks) {
+        var props = new ProviderProperties("openrouter", server.url("/api/v1").toString(), "test-key",
+                "nvidia/nemotron-3-super-120b-a12b:free", 3, Duration.ofSeconds(5), null, true, "/models", fallbacks);
+        return new OpenAiCompatibleProvider(WebClient.builder(), props);
+    }
+
+    @Test
+    void sendsOpenRouterFallbackModelsArrayInOrder() throws Exception {
+        server.enqueue(new MockResponse().setHeader("Content-Type", "application/json").setBody(OPENAI_RESPONSE));
+        openRouter(List.of("google/gemma-4-31b-it:free", "openrouter/free")).chat(request());
+        String body = server.takeRequest(1, TimeUnit.SECONDS).getBody().readUtf8();
+        assertThat(body).contains("\"model\":\"nvidia/nemotron-3-super-120b-a12b:free\"")
+                .contains("\"models\":[\"google/gemma-4-31b-it:free\",\"openrouter/free\"]")
+                .contains("\"messages\":[").contains("\"stream\":false").doesNotContain("\"request\"");
+    }
+
+    @Test
+    void sendsFallbackModelsInStreamRequest() throws Exception {
+        server.enqueue(new MockResponse().setHeader("Content-Type", "text/event-stream")
+                .setBody("data: {\"id\":\"x\",\"choices\":[]}\n\ndata: [DONE]\n\n"));
+        openRouter(List.of("openrouter/free")).chatStream(request()).collectList().block(Duration.ofSeconds(5));
+        String body = server.takeRequest(1, TimeUnit.SECONDS).getBody().readUtf8();
+        assertThat(body).contains("\"models\":[\"openrouter/free\"]").contains("\"stream\":true");
+    }
+
+    @Test
+    void noModelsFieldWithoutFallbacks() throws Exception {
+        server.enqueue(new MockResponse().setHeader("Content-Type", "application/json").setBody(OPENAI_RESPONSE));
+        provider(Duration.ofSeconds(5)).chat(request());
+        assertThat(server.takeRequest(1, TimeUnit.SECONDS).getBody().readUtf8()).doesNotContain("\"models\"");
     }
 }

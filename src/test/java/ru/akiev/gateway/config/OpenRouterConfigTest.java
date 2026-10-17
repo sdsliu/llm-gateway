@@ -33,4 +33,12 @@ class OpenRouterConfigTest {
         String model = (String) openRouter().get("model");
         assertThat(model).isNotEqualTo("meta-llama/llama-3.3-70b-instruct:free").endsWith(":free");
     }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void hasFreeFallbackModelsEndingWithRouter() throws Exception {
+        var fb = (List<String>) openRouter().get("fallback-models");
+        assertThat(fb).hasSize(3).last().isEqualTo("openrouter/free");
+        assertThat(fb.subList(0, 2)).allMatch(m -> m.endsWith(":free"));
+    }
 }

@@ -63,12 +63,19 @@ gateway:
       timeout: 120s
     # meta-llama/llama-3.3-70b-instruct:free снят с OpenRouter (endpoints: []) -> 404 "No endpoints found".
     # Замена (проверено 2026-10-17 по GET https://openrouter.ai/api/v1/models и /models/{id}/endpoints):
-    # nvidia/nemotron-3-super-120b-a12b:free, 262k контекст, tools. Запасной вариант — openrouter/free (роутер free-моделей).
+    # nvidia/nemotron-3-super-120b-a12b:free, 262k контекст, tools. Запасные — в fallback-models ниже.
     # Free-модели требуют разрешений в https://openrouter.ai/settings/privacy, иначе тоже 404 «No endpoints found».
     - name: openrouter
       base-url: https://openrouter.ai/api/v1
       api-key: ${OPENROUTER_API_KEY:}
       model: nvidia/nemotron-3-super-120b-a12b:free
+      # Нативные fallback-модели OpenRouter (поле "models" в теле): пробуются по порядку, если основная
+      # недоступна/лимит. Проверено 2026-10-17: у всех трёх :free есть живые endpoints;
+      # openrouter/free — роутер по всем бесплатным моделям, последний рубеж.
+      fallback-models:
+        - google/gemma-4-31b-it:free
+        - poolside/laguna-s-2.1:free
+        - openrouter/free
       priority: 3
       timeout: 120s
       limits:

@@ -34,7 +34,7 @@ class ProviderHealthPingTest {
 
     ProviderHealthService service(String pingPath) {
         var p = new ProviderProperties("openrouter", server.url("/api/v1").toString(), "secret", "m", 1,
-                Duration.ofSeconds(5), null, true, pingPath);
+                Duration.ofSeconds(5), null, true, pingPath, null);
         return new ProviderHealthService(new GatewayProperties(List.of(p), Duration.ofMinutes(5)),
                 WebClient.builder(), Clock.systemUTC(), Duration.ofSeconds(5), Duration.ofMinutes(10), false,
                 DataSize.ofMegabytes(16));
@@ -123,7 +123,7 @@ class ProviderHealthPingTest {
     void pingUrlForRealOpenRouterConfig() {
         for (String base : List.of("https://openrouter.ai/api/v1", "https://openrouter.ai/api/v1/")) {
             var p = new ProviderProperties("openrouter", base, "secret", "m", 1, Duration.ofSeconds(5), null, true,
-                    "/models");
+                    "/models", null);
             assertThat(ProviderHealthService.pingUrl(p)).isEqualTo("https://openrouter.ai/api/v1/models");
         }
     }

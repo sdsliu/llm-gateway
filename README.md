@@ -161,6 +161,8 @@ gateway:
 | Z.ai (GLM) | `https://api.z.ai/api/paas/v4` | `glm-4.7-flash` (бесплатная) | 2 |
 | OpenRouter | `https://openrouter.ai/api/v1` | `nvidia/nemotron-3-super-120b-a12b:free` | 3 |
 
+> OpenRouter: `fallback-models` в конфиге провайдера уходит в тело запроса как нативный параметр OpenRouter `models` ([Model Fallbacks](https://openrouter.ai/docs/guides/routing/model-fallbacks)): если основная модель недоступна или упёрлась в лимит, OpenRouter сам пробует следующие по порядку (сейчас `google/gemma-4-31b-it:free` → `poolside/laguna-s-2.1:free` → `openrouter/free`). Задавайте `fallback-models` только провайдерам, которые понимают поле `models`. Если OpenRouter всё же отвечает 404 «No endpoints found», шлюз переключается на следующего провайдера (как при 429/5xx).
+>
 > OpenRouter: бесплатные модели периодически снимают — тогда OpenRouter отвечает 404 «No endpoints found». Актуальный список: `curl https://openrouter.ai/api/v1/models` (id с `:free`). Тот же 404 бывает, если в https://openrouter.ai/settings/privacy запрещены провайдеры, обучающиеся на запросах (free-модели их требуют).
 
 Подойдёт любой OpenAI-совместимый сервер (OpenAI, Together, vLLM, Ollama `http://localhost:11434/v1` и т. д.):
