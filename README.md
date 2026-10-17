@@ -275,7 +275,7 @@ gateway:
 
 ```bash
 curl localhost:4000/status/routing
-# {"mode":"PRIORITY","primary":null,"providers":["groq","zai","openrouter"],"order":["groq","zai","openrouter"]}
+# {"mode":"PRIORITY","primary":null,"providers":["groq","sambanova","zai","openrouter"],"order":["groq","sambanova","zai","openrouter"]}
 curl -X PUT localhost:4000/status/routing -H 'Content-Type: application/json' \
      -d '{"mode":"PRIORITY","primary":"openrouter"}'
 curl -X PUT localhost:4000/status/routing -H 'Content-Type: application/json' -d '{"mode":"ROUND_ROBIN"}'
