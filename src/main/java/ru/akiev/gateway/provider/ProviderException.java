@@ -40,6 +40,16 @@ public class ProviderException extends RuntimeException {
     }
 
     /**
+     * Запрос слишком большой для ЭТОГО провайдера: 413 или «Request too large» (Groq отвечает 413 при
+     * превышении TPM одним запросом). Повтор к тому же провайдеру бессмыслен, cooldown не нужен —
+     * провайдер исправен, просто лимит меньше запроса. Другой провайдер (с большим лимитом) может принять.
+     */
+    public boolean isRequestTooLarge() {
+        String m = getMessage() == null ? "" : getMessage();
+        return status == 413 || m.contains("Request too large") || m.contains("request_too_large");
+    }
+
+    /**
      * OpenRouter 404 «No endpoints found ...»: у провайдера сейчас нет живой модели
      * (free-модель снята, все запасные недоступны, ограничения privacy). У другого провайдера
      * запрос может пройти — переключаемся.

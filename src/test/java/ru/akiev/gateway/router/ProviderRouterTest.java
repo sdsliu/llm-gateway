@@ -167,6 +167,47 @@ class ProviderRouterTest {
         assertThat(primary.getRequestCount() + secondary.getRequestCount()).isEqualTo(2);
     }
 
+    static MockResponse tooLarge() {
+        return new MockResponse().setResponseCode(413).setHeader("Content-Type", "application/json")
+                .setBody("{\"error\":{\"message\":\"Request too large for model `m` in organization `org_secret` on tokens per minute (TPM): Limit 8000, Requested 9068\",\"type\":\"tokens\",\"code\":\"rate_limit_exceeded\"}}");
+    }
+
+    @Test
+    void requestTooLargeFailsOverWithoutCooldown() {
+        primary.enqueue(tooLarge());
+        secondary.enqueue(json(ok("from-secondary")));
+        assertThat(answer()).isEqualTo("from-secondary");
+        // провайдер исправен — cooldown не ставим, следующий (маленький) запрос снова пойдёт на primary
+        assertThat(p1.state().isAvailable(clock.instant())).isTrue();
+        primary.enqueue(json(ok("from-primary")));
+        assertThat(answer()).isEqualTo("from-primary");
+        assertThat(primary.getRequestCount()).isEqualTo(2);
+    }
+
+    @Test
+    void requestTooLargeForAllProvidersGivesRequestTooLargeWithoutRetry() {
+        primary.enqueue(tooLarge());
+        secondary.enqueue(tooLarge());
+        assertThatThrownBy(this::answer)
+                .isInstanceOf(RequestTooLargeException.class)
+                .hasMessageContaining("primary, secondary")
+                .hasMessageNotContaining("org_secret");
+        // каждый провайдер — ровно один раз, без повторов
+        assertThat(primary.getRequestCount()).isEqualTo(1);
+        assertThat(secondary.getRequestCount()).isEqualTo(1);
+        assertThat(p1.state().isAvailable(clock.instant())).isTrue();
+    }
+
+    @Test
+    void requestTooLargePlusOutageIsStillUnavailable() {
+        primary.enqueue(tooLarge());
+        secondary.enqueue(new MockResponse().setResponseCode(500));
+        assertThatThrownBy(this::answer)
+                .isInstanceOf(AllProvidersUnavailableException.class)
+                .hasMessageContaining("primary: request too large")
+                .hasMessageContaining("secondary: HTTP 500");
+    }
+
     @Test
     void badRequestIsNotRetried() {
         primary.enqueue(new MockResponse().setResponseCode(400).setBody("{\"error\":{\"message\":\"bad\"}}"));
