@@ -34,6 +34,7 @@ function render(s) {
   document.getElementById('t-tok').textContent = fmt(s.today.tokens);
   document.getElementById('t-err').textContent = fmt(s.today.errors);
   document.getElementById('t-upd').textContent = time(s.generated_at);
+  if (s.routing) renderRouting(s.routing);
   renderProviders(s.providers);
   renderChart(s);
   renderRecent(s.recent);
@@ -103,6 +104,47 @@ function renderProviders(list) {
     </div>`;
   }).join('');
 }
+
+// Режим роутинга: состояние приходит в snapshot (SSE) и в ответе PUT /status/routing.
+const MODE_RU = { PRIORITY: 'по приоритету', ROUND_ROBIN: 'round-robin' };
+let routingBusy = false;
+
+function renderRouting(r) {
+  if (routingBusy) return; // не перетираем выбор, пока ждём ответ PUT
+  document.querySelectorAll('#routing input[name=mode]').forEach(i => { i.checked = i.value === r.mode; });
+  const sel = document.getElementById('primary');
+  const opts = ['', ...r.providers];
+  if (sel.options.length !== opts.length || [...sel.options].some((o, i) => o.value !== opts[i])) {
+    sel.innerHTML = opts.map(n => `<option value="${esc(n)}">${n ? esc(n) : '— по приоритету —'}</option>`).join('');
+  }
+  sel.value = r.primary ?? '';
+  sel.disabled = r.mode !== 'PRIORITY';
+  document.getElementById('rt-current').innerHTML = `Сейчас: <b>${MODE_RU[r.mode] ?? esc(r.mode)}</b>`
+    + (r.mode === 'PRIORITY' ? ` · primary: <b>${r.primary ? esc(r.primary) : '—'}</b>` : '')
+    + ` · следующий запрос: ${r.order.length ? r.order.map(esc).join(' → ') : '<span class="muted">нет провайдеров</span>'}`;
+}
+
+async function saveRouting() {
+  const mode = document.querySelector('#routing input[name=mode]:checked')?.value;
+  const primary = document.getElementById('primary').value || null;
+  const msg = document.getElementById('rt-msg');
+  routingBusy = true; msg.textContent = 'сохраняю…'; msg.className = '';
+  try {
+    const r = await fetch('/status/routing', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode, primary }),
+    });
+    const body = await r.json();
+    routingBusy = false;
+    if (!r.ok) { msg.textContent = body.error?.message ?? ('HTTP ' + r.status); msg.className = 'bad'; return; }
+    renderRouting(body);
+    msg.textContent = 'сохранено'; msg.className = 'ok';
+  } catch (err) {
+    routingBusy = false; msg.textContent = String(err); msg.className = 'bad';
+  }
+}
+
+document.getElementById('routing').addEventListener('change', saveRouting);
+fetch('/status/routing').then(r => r.json()).then(renderRouting).catch(() => {});
 
 async function post(url) {
   const r = await fetch(url, { method: 'POST' });

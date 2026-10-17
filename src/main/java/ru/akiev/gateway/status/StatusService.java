@@ -107,7 +107,14 @@ public class StatusService {
                 hourly(last24h, now),
                 repository.findTop20ByOrderByCreatedAtDescIdDesc().stream().map(r -> new RecentRequest(
                         r.getCreatedAt(), r.getProvider(), r.getModel(), r.getStatus(), r.getLatencyMs(),
-                        r.getPromptTokens(), r.getCompletionTokens(), r.getTotalTokens(), r.getError())).toList());
+                        r.getPromptTokens(), r.getCompletionTokens(), r.getTotalTokens(), r.getError())).toList(),
+                routing());
+    }
+
+    public RoutingInfo routing() {
+        var s = router.routing();
+        return new RoutingInfo(s.mode(), s.primary(), router.names(),
+                router.previewOrder().stream().map(LlmProvider::name).toList());
     }
 
     private StatusSnapshot.KeyInfo keyInfo(String provider) {

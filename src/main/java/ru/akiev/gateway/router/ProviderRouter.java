@@ -8,6 +8,7 @@ import java.util.Comparator;
 import java.util.Iterator;
 import java.util.stream.Stream;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import ru.akiev.gateway.dto.ChatRequest;
@@ -31,6 +32,10 @@ import ru.akiev.gateway.provider.ProviderException;
  *   <li>Никого не осталось — {@link AllProvidersUnavailableException} → HTTP 503.</li>
  * </ol>
  *
+ * <p>Порядок перебора задаёт режим роутинга ({@link RoutingMode}, меняется в runtime через
+ * {@link #setRouting}): PRIORITY — по priority (выбранный primary — первым), ROUND_ROBIN — по кругу
+ * среди доступных сейчас провайдеров, остальные шаги алгоритма (пропуск, failover) те же.
+ *
  * <p>Это «последовательный» failover внутри одного HTTP-запроса клиента: клиент ничего не
  * знает о переключениях, он просто получает ответ (чуть позже).
  */
@@ -42,6 +47,10 @@ public class ProviderRouter {
     private final Duration defaultCooldown;
     private final Clock clock;
     private final RouterListener listener;
+    /** Текущий режим. volatile + неизменяемый record: запросы читают без блокировок. */
+    private volatile RoutingSettings routing = RoutingSettings.DEFAULT;
+    /** Счётчик round-robin: getAndIncrement атомарен, два параллельных запроса не получат один старт. */
+    private final AtomicLong rrCounter = new AtomicLong();
 
     public ProviderRouter(List<LlmProvider> providers, Duration defaultCooldown, Clock clock) {
         this(providers, defaultCooldown, clock, RouterListener.NOOP);
@@ -59,9 +68,73 @@ public class ProviderRouter {
         return providers;
     }
 
+    public RoutingSettings routing() {
+        return routing;
+    }
+
+    /**
+     * Сменить режим роутинга (только в памяти). primary должен быть одним из включённых провайдеров
+     * (с api-key), иначе {@link IllegalArgumentException}.
+     */
+    public synchronized RoutingSettings setRouting(RoutingSettings next) {
+        if (next.primary() != null && providers.stream().noneMatch(p -> p.name().equals(next.primary()))) {
+            throw new IllegalArgumentException("Unknown or disabled provider: " + next.primary()
+                    + " (available: " + String.join(", ", names()) + ")");
+        }
+        RoutingSettings prev = routing;
+        routing = next;
+        if (!prev.equals(next)) {
+            log.info("Режим роутинга изменён: {} → {}", prev, next);
+        }
+        return next;
+    }
+
+    public List<String> names() {
+        return providers.stream().map(LlmProvider::name).toList();
+    }
+
+    /** Порядок, в котором будет перебирать провайдеров следующий запрос (без сдвига round-robin). */
+    public List<LlmProvider> previewOrder() {
+        return order(false);
+    }
+
+    /**
+     * Порядок перебора для одного запроса.
+     * <ul>
+     *   <li>PRIORITY: по priority, primary (если задан) — первым;</li>
+     *   <li>ROUND_ROBIN: доступные сейчас провайдеры, сдвинутые на очередной шаг счётчика; недоступные
+     *       (cooldown/лимит) — в хвосте, их пропустит основной цикл (и запишет в причины 503).
+     *       При ошибке цикл просто идёт к следующему в этом списке — это и есть failover.</li>
+     * </ul>
+     */
+    List<LlmProvider> order(boolean advance) {
+        RoutingSettings s = routing;
+        if (s.mode() == RoutingMode.ROUND_ROBIN) {
+            Instant now = clock.instant();
+            List<LlmProvider> available = providers.stream().filter(p -> p.state().isAvailable(now)).toList();
+            if (available.isEmpty()) {
+                return providers;
+            }
+            long n = advance ? rrCounter.getAndIncrement() : rrCounter.get();
+            int start = (int) Math.floorMod(n, (long) available.size());
+            List<LlmProvider> result = new ArrayList<>(providers.size());
+            result.addAll(available.subList(start, available.size()));
+            result.addAll(available.subList(0, start));
+            providers.stream().filter(p -> !available.contains(p)).forEach(result::add);
+            return result;
+        }
+        if (s.primary() == null) {
+            return providers;
+        }
+        List<LlmProvider> result = new ArrayList<>(providers.size());
+        providers.stream().filter(p -> p.name().equals(s.primary())).forEach(result::add);
+        providers.stream().filter(p -> !p.name().equals(s.primary())).forEach(result::add);
+        return result;
+    }
+
     public ChatResponse chat(ChatRequest request) {
         List<String> failures = new ArrayList<>();
-        for (LlmProvider p : providers) {
+        for (LlmProvider p : order(true)) {
             Instant now = clock.instant();
             if (!p.state().isAvailable(now)) {
                 log.debug("Пропускаем {}: недоступен (cooldown до {}, причина: {})",
@@ -70,7 +143,7 @@ public class ProviderRouter {
                 continue;
             }
             try {
-                log.info("Запрос → провайдер {} (priority {})", p.name(), p.priority());
+                log.info("Запрос → провайдер {} (priority {}, режим {})", p.name(), p.priority(), routing.mode());
                 long start = System.nanoTime();
                 try {
                     ChatResponse resp = p.chat(request);
@@ -118,12 +191,12 @@ public class ProviderRouter {
      */
     public StreamSession openStream(ChatRequest request) {
         List<String> failures = new ArrayList<>();
-        for (LlmProvider p : providers) {
+        for (LlmProvider p : order(true)) {
             if (!p.state().isAvailable(clock.instant())) {
                 failures.add(p.name() + ": unavailable");
                 continue;
             }
-            log.info("Стрим → провайдер {} (priority {})", p.name(), p.priority());
+            log.info("Стрим → провайдер {} (priority {}, режим {})", p.name(), p.priority(), routing.mode());
             long start = System.nanoTime();
             Stream<String> stream = p.chatStream(request).toStream(STREAM_PREFETCH);
             Iterator<String> it = stream.iterator();
