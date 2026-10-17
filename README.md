@@ -1,7 +1,7 @@
 # llm-gateway
 
 Личный **OpenAI-совместимый LLM-шлюз** на Spring Boot 3 / Java 21. Он принимает запросы в формате
-OpenAI Chat Completions и отправляет их бесплатным или дешёвым провайдерам (Groq, Z.ai, OpenRouter и др.).
+OpenAI Chat Completions и отправляет их бесплатным или дешёвым провайдерам (Groq, SambaNova, Z.ai, OpenRouter и др.).
 Провайдеры перебираются по приоритету, а при исчерпании лимитов шлюз автоматически переключается на следующего.
 Каждый запрос записывается в PostgreSQL, а состояние видно на живом веб-дашборде.
 
@@ -12,7 +12,7 @@ OpenAI Chat Completions и отправляет их бесплатным или
 
 - `POST /v1/chat/completions` и `GET /v1/models` в формате OpenAI. Неизвестные поля игнорируются.
 - **Стриминг** `stream: true`: SSE в формате OpenAI (`data: {chunk}` … `data: [DONE]`).
-- **Ротация провайдеров** по `priority`. При 429, 5xx, 401/403 и таймаутах провайдер уходит на паузу
+- **Ротация провайдеров** по `priority`. При 429, 5xx, 401/402/403 и таймаутах провайдер уходит на паузу
   (`Retry-After` или 5 минут), а запрос повторяется у следующего. Если недоступны все — `503` в формате OpenAI.
 - **Лимиты**: собственные RPM/RPD на провайдера (скользящие окна) и учёт заголовков
   `x-ratelimit-remaining-*` / `Retry-After`.
@@ -30,8 +30,9 @@ flowchart LR
     C[Клиенты<br/>Aider · OpenHands · curl · OpenAI SDK] -->|POST /v1/chat/completions| API[ChatController<br/>api]
     API --> R[ProviderRouter<br/>router]
     R -->|priority 1| G[Groq]
-    R -->|priority 2| Z[Z.ai GLM]
-    R -->|priority 3| OR[OpenRouter]
+    R -->|priority 2| SN[SambaNova]
+    R -->|priority 3| Z[Z.ai GLM]
+    R -->|priority 4| OR[OpenRouter]
     R -. состояние: cooldown, RPM/RPD,<br/>x-ratelimit-* .-> S[(ProviderState<br/>LimitTracker)]
     R -->|RouterListener| U[UsageService<br/>usage]
     U --> DB[(PostgreSQL<br/>usage_record)]
@@ -108,6 +109,7 @@ Ping по расписанию: `gateway.health.scheduled=true` (интерва�
 | Переменная | По умолчанию | Назначение |
 |---|---|---|
 | `GROQ_API_KEY` | — | ключ Groq (пусто → провайдер пропускается) |
+| `SAMBANOVA_API_KEY` | — | ключ SambaNova Cloud, https://cloud.sambanova.ai/apis |
 | `ZAI_API_KEY` | — | ключ Z.ai (Zhipu GLM), https://z.ai/manage-apikey/apikey-list |
 | `OPENROUTER_API_KEY` | — | ключ OpenRouter; включает опрос `/api/v1/key` |
 | `DB_URL` | `jdbc:postgresql://localhost:5432/gateway` | JDBC URL |
@@ -120,7 +122,7 @@ Ping по расписанию: `gateway.health.scheduled=true` (интерва�
 
 ```yaml
 gateway:
-  default-cooldown: 5m            # пауза после 429/5xx без Retry-After
+  default-cooldown: 5m            # пауза после 429/5xx/402/таймаута без Retry-After
   openrouter:
     name: openrouter              # какой провайдер опрашивать через GET /key
     poll-interval: PT5M           # ISO-8601
@@ -148,7 +150,9 @@ gateway:
 | `api-key` | нет | пустой → провайдер пропускается (`skipped`) |
 | `model` | да | реальная модель провайдера (подменяет модель клиента) |
 | `priority` | нет (100) | порядок перебора |
-| `timeout` | нет (120s) | таймаут запроса |
+| `timeout` | нет (120s) | таймаут запроса к этому провайдеру (non-stream — весь ответ, stream — до/между чанками); истёк → 504, cooldown и failover |
+| `extra-body` | нет | доп. поля верхнего уровня в теле `/chat/completions` только для этого провайдера (например Z.ai `thinking: {type: disabled}`); `model`, `messages`, `stream`, `stream_options`, `models` не переопределяются |
+| `fallback-models` | нет | запасные модели OpenRouter (поле `models`) |
 | `limits.rpm` / `limits.rpd` | нет | лимиты запросов в минуту/сутки |
 | `stream-usage` | нет (true) | запрашивать usage в стриме |
 | `ping-path` | нет (`/models`) | путь ping дашборда; 404/405 = «доступен, список моделей не поддерживается» |
@@ -158,9 +162,14 @@ gateway:
 | Провайдер | base-url | Модель по умолчанию | priority |
 |---|---|---|---|
 | Groq | `https://api.groq.com/openai/v1` | `openai/gpt-oss-120b` | 1 |
-| Z.ai (GLM) | `https://api.z.ai/api/paas/v4` | `glm-4.7-flash` (бесплатная) | 2 |
-| OpenRouter | `https://openrouter.ai/api/v1` | `nvidia/nemotron-3-super-120b-a12b:free` | 3 |
+| SambaNova Cloud | `https://api.sambanova.ai/v1` | `gpt-oss-120b` (Free Tier: 20 RPM / 20 RPD / 200K TPD на модель) | 2 |
+| Z.ai (GLM) | `https://api.z.ai/api/paas/v4` | `glm-4.7-flash` (бесплатная; thinking выключен, timeout 20s) | 3 |
+| OpenRouter | `https://openrouter.ai/api/v1` | `nvidia/nemotron-3-super-120b-a12b:free` | 4 |
 
+> SambaNova: OpenAI-совместимый API, `Authorization: Bearer <SAMBANOVA_API_KEY>` ([API keys and URLs](https://docs.sambanova.ai/docs/en/get-started/api-keys-urls), [OpenAI compatibility](https://docs.sambanova.ai/docs/en/features/openai-compatibility)). Лимиты Free Tier по [Rate limits](https://docs.sambanova.ai/docs/en/models/rate-limits): 20 RPM / 20 RPD / 200K токенов в день на каждую модель; заголовки `x-ratelimit-*-requests` (минута) и `x-ratelimit-*-requests-day` (сутки). **Важно:** с августа 2026 SambaCloud без привязанной карты отвечает `402 PAYMENT_METHOD_REQUIRED` (проверено 2026-10-17 на всех моделях из `/v1/models`). Шлюз считает 402 поводом для failover: SambaNova получает cooldown, запрос уходит дальше.
+>
+> Z.ai: у GLM-4.7 «размышление» включено по умолчанию — простой запрос тратил ~1600 completion-токенов и 36–77 с. В конфиге `extra-body.thinking.type: disabled` ([Thinking Mode](https://docs.z.ai/guides/capabilities/thinking-mode), [Chat Completion](https://docs.z.ai/api-reference/llm/chat-completion)): reasoning-токенов 0. Задержка бесплатной `glm-4.7-flash` всё равно зависит от загрузки Z.ai (бывает 429 code 1305 «overloaded»), поэтому `timeout: 20s`: дольше ждать нет смысла, клиенты вроде path-code-ai отваливаются по read-timeout 30s.
+>
 > OpenRouter: `fallback-models` в конфиге провайдера уходит в тело запроса как нативный параметр OpenRouter `models` ([Model Fallbacks](https://openrouter.ai/docs/guides/routing/model-fallbacks)): если основная модель недоступна или упёрлась в лимит, OpenRouter сам пробует следующие по порядку (сейчас `google/gemma-4-31b-it:free` → `poolside/laguna-s-2.1:free` → `openrouter/free`). Задавайте `fallback-models` только провайдерам, которые понимают поле `models`. Если OpenRouter всё же отвечает 404 «No endpoints found», шлюз переключается на следующего провайдера (как при 429/5xx).
 >
 > OpenRouter: бесплатные модели периодически снимают — тогда OpenRouter отвечает 404 «No endpoints found». Актуальный список: `curl https://openrouter.ai/api/v1/models` (id с `:free`). Тот же 404 бывает, если в https://openrouter.ai/settings/privacy запрещены провайдеры, обучающиеся на запросах (free-модели их требуют).

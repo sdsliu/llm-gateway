@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import okhttp3.mockwebserver.MockResponse;
 import okhttp3.mockwebserver.MockWebServer;
@@ -120,5 +121,53 @@ class OpenAiCompatibleProviderTest {
         server.enqueue(new MockResponse().setHeader("Content-Type", "application/json").setBody(OPENAI_RESPONSE));
         provider(Duration.ofSeconds(5)).chat(request());
         assertThat(server.takeRequest(1, TimeUnit.SECONDS).getBody().readUtf8()).doesNotContain("\"models\"");
+    }
+
+    OpenAiCompatibleProvider zai(Map<String, Object> extraBody, List<String> fallbacks) {
+        var props = new ProviderProperties("zai", server.url("/api/paas/v4").toString(), "test-key",
+                "glm-4.7-flash", 3, Duration.ofSeconds(5), null, true, "/models", fallbacks, extraBody);
+        return new OpenAiCompatibleProvider(WebClient.builder(), props);
+    }
+
+    static final Map<String, Object> THINKING_OFF = Map.of("thinking", Map.of("type", "disabled"));
+
+    @Test
+    void sendsExtraBodyFieldsAtTopLevel() throws Exception {
+        server.enqueue(new MockResponse().setHeader("Content-Type", "application/json").setBody(OPENAI_RESPONSE));
+        zai(THINKING_OFF, null).chat(request());
+        String body = server.takeRequest(1, TimeUnit.SECONDS).getBody().readUtf8();
+        assertThat(body).contains("\"thinking\":{\"type\":\"disabled\"}")
+                .contains("\"model\":\"glm-4.7-flash\"").contains("\"stream\":false")
+                .doesNotContain("\"extra\"").doesNotContain("\"request\"").doesNotContain("\"models\"");
+    }
+
+    @Test
+    void sendsExtraBodyInStreamRequest() throws Exception {
+        server.enqueue(new MockResponse().setHeader("Content-Type", "text/event-stream")
+                .setBody("data: {\"id\":\"x\",\"choices\":[]}\n\ndata: [DONE]\n\n"));
+        zai(THINKING_OFF, null).chatStream(request()).collectList().block(Duration.ofSeconds(5));
+        String body = server.takeRequest(1, TimeUnit.SECONDS).getBody().readUtf8();
+        assertThat(body).contains("\"thinking\":{\"type\":\"disabled\"}").contains("\"stream\":true");
+    }
+
+    @Test
+    void extraBodyCannotOverrideGatewayFieldsAndCombinesWithFallbacks() throws Exception {
+        server.enqueue(new MockResponse().setHeader("Content-Type", "application/json").setBody(OPENAI_RESPONSE));
+        zai(Map.of("model", "evil", "stream", true, "models", List.of("x"), "reasoning_effort", "low"),
+                List.of("openrouter/free")).chat(request());
+        String body = server.takeRequest(1, TimeUnit.SECONDS).getBody().readUtf8();
+        assertThat(body).contains("\"model\":\"glm-4.7-flash\"").doesNotContain("evil")
+                .contains("\"stream\":false").contains("\"models\":[\"openrouter/free\"]")
+                .contains("\"reasoning_effort\":\"low\"");
+    }
+
+    @Test
+    void http402BecomesRetriableProviderException() {
+        server.enqueue(new MockResponse().setResponseCode(402)
+                .setBody("{\"error\":{\"code\":\"PAYMENT_METHOD_REQUIRED\"}}"));
+        assertThatThrownBy(() -> provider(Duration.ofSeconds(5)).chat(request()))
+                .isInstanceOf(ProviderException.class)
+                .satisfies(e -> assertThat(((ProviderException) e).status()).isEqualTo(402))
+                .satisfies(e -> assertThat(((ProviderException) e).isRetriable()).isTrue());
     }
 }

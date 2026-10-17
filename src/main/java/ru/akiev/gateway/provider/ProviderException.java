@@ -32,9 +32,11 @@ public class ProviderException extends RuntimeException {
      * 502/504 (сеть/таймаут). Остальные 4xx (400, 401...) — ошибка запроса или ключа:
      * 400 у другого провайдера, скорее всего, повторится, поэтому отдаём клиенту сразу.
      * 401/403 тоже считаем поводом переключиться — ключ мог протухнуть.
+     * 402 Payment Required — у ЭТОГО провайдера кончились кредиты / нужна карта
+     * (SambaNova: {@code PAYMENT_METHOD_REQUIRED}), другой провайдер запрос выполнит.
      */
     public boolean isRetriable() {
-        return status == 429 || status == 401 || status == 403 || status >= 500 || isNoEndpoints();
+        return status == 429 || status == 401 || status == 402 || status == 403 || status >= 500 || isNoEndpoints();
     }
 
     /**

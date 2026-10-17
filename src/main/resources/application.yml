@@ -51,6 +51,23 @@ gateway:
       limits:
         rpm: 30
         rpd: 1000
+    # SambaNova Cloud: OpenAI-совместимый API, Bearer-ключ, https://docs.sambanova.ai
+    # Free Tier (без привязанной карты): 20 RPM / 20 RPD / 200K токенов в день НА МОДЕЛЬ
+    # (https://docs.sambanova.ai/docs/en/models/rate-limits). gpt-oss-120b — production-модель,
+    # проверено по GET https://api.sambanova.ai/v1/models 2026-10-17. Быстрый — ставим перед медленным Z.ai.
+    # ВНИМАНИЕ: с 2026-08 SambaCloud требует карту даже для Free-плана — аккаунт без карты получает
+    # 402 PAYMENT_METHOD_REQUIRED (проверено 2026-10-17 на всех моделях). 402 считается retriable:
+    # cooldown + failover на следующего провайдера, так что без карты провайдер просто «пропускается».
+    # Заголовки лимитов: x-ratelimit-*-requests (минута) и x-ratelimit-*-requests-day (сутки).
+    - name: sambanova
+      base-url: https://api.sambanova.ai/v1
+      api-key: ${SAMBANOVA_API_KEY:}
+      model: gpt-oss-120b
+      priority: 2
+      timeout: 120s
+      limits:
+        rpm: 20
+        rpd: 20
     # Z.ai (Zhipu GLM): OpenAI-совместимый API, https://docs.z.ai/guides/overview/quick-start
     # glm-4.7-flash — бесплатная модель (https://docs.z.ai/guides/overview/pricing).
     # GET /models в документации Z.ai не описан: если он ответит 404/405, ping считает провайдера
@@ -59,8 +76,16 @@ gateway:
       base-url: https://api.z.ai/api/paas/v4
       api-key: ${ZAI_API_KEY:}
       model: glm-4.7-flash
-      priority: 2
-      timeout: 120s
+      priority: 3
+      # У GLM-4.7 thinking включён по умолчанию и обязателен при enabled: 36-77 с и ~1600 completion-токенов
+      # на простой запрос. Отключаем (https://docs.z.ai/guides/capabilities/thinking-mode,
+      # https://docs.z.ai/api-reference/llm/chat-completion — ChatThinking.type: enabled|disabled).
+      extra-body:
+        thinking:
+          type: disabled
+      # Короткий таймаут: дольше 20 с ждать нет смысла — клиенты (path-code-ai) отвалятся раньше.
+      # Таймаут = 504 -> cooldown (default-cooldown) и failover на openrouter.
+      timeout: 20s
     # meta-llama/llama-3.3-70b-instruct:free снят с OpenRouter (endpoints: []) -> 404 "No endpoints found".
     # Замена (проверено 2026-10-17 по GET https://openrouter.ai/api/v1/models и /models/{id}/endpoints):
     # nvidia/nemotron-3-super-120b-a12b:free, 262k контекст, tools. Запасные — в fallback-models ниже.
@@ -76,7 +101,7 @@ gateway:
         - google/gemma-4-31b-it:free
         - poolside/laguna-s-2.1:free
         - openrouter/free
-      priority: 3
+      priority: 4
       timeout: 120s
       limits:
         rpm: 20
