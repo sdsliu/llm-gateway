@@ -17,7 +17,6 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.util.unit.DataSize;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.springframework.http.HttpHeaders;
 import org.springframework.http.ResponseEntity;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
@@ -70,10 +69,10 @@ public class ProviderHealthService {
         this.scheduled = scheduled;
         for (ProviderProperties p : props.providers()) {
             providers.put(p.name(), p);
-            if (p.hasApiKey()) {
+            if (p.enabled()) {
                 clients.put(p.name(), builder.clone().baseUrl(p.baseUrl())
                         .codecs(c -> c.defaultCodecs().maxInMemorySize((int) maxBodySize.toBytes()))
-                        .defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + p.apiKey()).build());
+                        .defaultHeaders(p::applyAuth).build());
             }
         }
     }

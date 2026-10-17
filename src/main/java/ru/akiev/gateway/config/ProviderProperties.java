@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.Map;
 import org.springframework.boot.context.properties.bind.ConstructorBinding;
 import org.springframework.boot.context.properties.bind.DefaultValue;
+import org.springframework.http.HttpHeaders;
 
 /**
  * Настройки одного провайдера (элемент списка gateway.providers).
@@ -27,6 +28,9 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  * @param extraBody   дополнительные поля верхнего уровня в теле /chat/completions, специфичные для
  *                    провайдера (например Z.ai {@code thinking: {type: disabled}}). Поля, которые
  *                    формирует сам шлюз (model, messages, stream, stream_options, models), не переопределяются.
+ * @param apiKeyOptional провайдер работает и без ключа (keyless/anonymous режим, например Kilo Gateway или
+ *                    OVHcloud AI Endpoints): при пустом api-key он НЕ пропускается, а запросы уходят без
+ *                    заголовка Authorization. Ключ, если задан, отправляется как обычно (выше лимиты).
  */
 public record ProviderProperties(
         @NotBlank String name,
@@ -39,7 +43,8 @@ public record ProviderProperties(
         @DefaultValue("true") boolean streamUsage,
         @DefaultValue("/models") String pingPath,
         List<String> fallbackModels,
-        Map<String, Object> extraBody) {
+        Map<String, Object> extraBody,
+        @DefaultValue("false") boolean apiKeyOptional) {
 
     /** Канонический конструктор — по нему Spring Boot биндит application.yml (их у record теперь два). */
     @ConstructorBinding
@@ -54,11 +59,34 @@ public record ProviderProperties(
         this(name, baseUrl, apiKey, model, priority, timeout, limits, streamUsage, pingPath, fallbackModels, null);
     }
 
+    /** Без api-key-optional (ключ обязателен). */
+    public ProviderProperties(String name, String baseUrl, String apiKey, String model, int priority,
+            Duration timeout, Limits limits, boolean streamUsage, String pingPath, List<String> fallbackModels,
+            Map<String, Object> extraBody) {
+        this(name, baseUrl, apiKey, model, priority, timeout, limits, streamUsage, pingPath, fallbackModels,
+                extraBody, false);
+    }
+
     public record Limits(Integer rpm, Integer rpd) {
     }
 
-    /** Провайдер без ключа пропускаем (например, ключ Z.ai не задан в окружении). */
+    /** Задан ли ключ. Только тогда шлём заголовок Authorization: Bearer. */
     public boolean hasApiKey() {
         return apiKey != null && !apiKey.isBlank();
+    }
+
+    /**
+     * Включён ли провайдер: есть ключ или ключ необязателен (api-key-optional: true).
+     * Провайдер без ключа и без api-key-optional пропускаем (например, ключ Z.ai не задан в окружении).
+     */
+    public boolean enabled() {
+        return hasApiKey() || apiKeyOptional;
+    }
+
+    /** Добавляет Authorization: Bearer, только если ключ задан (keyless-провайдерам заголовок не шлём). */
+    public void applyAuth(HttpHeaders headers) {
+        if (hasApiKey()) {
+            headers.setBearerAuth(apiKey.trim());
+        }
     }
 }

@@ -1,7 +1,7 @@
 # llm-gateway
 
 Личный **OpenAI-совместимый LLM-шлюз** на Spring Boot 3 / Java 21. Он принимает запросы в формате
-OpenAI Chat Completions и отправляет их бесплатным или дешёвым провайдерам (Groq, SambaNova, Z.ai, OpenRouter и др.).
+OpenAI Chat Completions и отправляет их бесплатным или дешёвым провайдерам (Groq, Z.ai, Kilo, OVHcloud, Cloudflare Workers AI, OpenRouter, SambaNova и др.).
 Провайдеры перебираются по приоритету, а при исчерпании лимитов шлюз автоматически переключается на следующего.
 Каждый запрос записывается в PostgreSQL, а состояние видно на живом веб-дашборде.
 
@@ -31,9 +31,12 @@ flowchart LR
     C[Клиенты<br/>Aider · OpenHands · curl · OpenAI SDK] -->|POST /v1/chat/completions| API[ChatController<br/>api]
     API --> R[ProviderRouter<br/>router]
     R -->|priority 1| G[Groq]
-    R -->|priority 2| SN[SambaNova]
-    R -->|priority 3| Z[Z.ai GLM]
-    R -->|priority 4| OR[OpenRouter]
+    R -->|priority 2| Z[Z.ai GLM]
+    R -->|priority 3| K[Kilo Gateway<br/>без ключа]
+    R -->|priority 4| OVH[OVHcloud AI Endpoints<br/>без ключа]
+    R -->|priority 5| CF[Cloudflare Workers AI]
+    R -->|priority 6| OR[OpenRouter]
+    R -->|priority 7| SN[SambaNova]
     R -. состояние: cooldown, RPM/RPD,<br/>x-ratelimit-* .-> S[(ProviderState<br/>LimitTracker)]
     R -->|RouterListener| U[UsageService<br/>usage]
     U --> DB[(PostgreSQL<br/>usage_record)]
@@ -55,7 +58,8 @@ flowchart LR
 
 ## Быстрый старт
 
-Нужен ключ хотя бы одного провайдера. Бесплатный ключ Groq: https://console.groq.com/keys
+Ключи необязательны: Kilo Gateway и OVHcloud AI Endpoints работают анонимно (keyless), с небольшими лимитами на IP.
+Для нормальной работы задайте хотя бы один ключ. Бесплатный ключ Groq: https://console.groq.com/keys
 
 ### Вариант 1: Docker Compose (шлюз + PostgreSQL 16)
 
@@ -113,6 +117,11 @@ Ping по расписанию: `gateway.health.scheduled=true` (интерва�
 | `SAMBANOVA_API_KEY` | — | ключ SambaNova Cloud, https://cloud.sambanova.ai/apis |
 | `ZAI_API_KEY` | — | ключ Z.ai (Zhipu GLM), https://z.ai/manage-apikey/apikey-list |
 | `OPENROUTER_API_KEY` | — | ключ OpenRouter; включает опрос `/api/v1/key` |
+| `KILO_API_KEY` | — | необязательный ключ Kilo AI Gateway; без него — анонимно (free-модели, 200 запросов/час на IP) |
+| `OVH_AI_API_KEY` | — | необязательный ключ OVHcloud AI Endpoints; без него — анонимно (2 запроса/мин на IP и модель) |
+| `OVH_AI_RPM` | `2` | RPM шлюза для OVHcloud; с ключом поставьте `400` |
+| `CLOUDFLARE_API_TOKEN` | — | токен Cloudflare с правами Workers AI (пусто → провайдер пропускается) |
+| `CLOUDFLARE_ACCOUNT_ID` | — | Account ID Cloudflare, подставляется в base-url |
 | `DB_URL` | `jdbc:postgresql://localhost:5432/gateway` | JDBC URL |
 | `DB_USER` / `DB_PASSWORD` | `gateway` / `gateway` | учётные данные БД |
 | `DB_NAME`, `DB_PORT`, `GATEWAY_PORT` | `gateway`, `5432`, `4000` | только для docker compose |
@@ -148,7 +157,8 @@ gateway:
 |---|---|---|
 | `name` | да | имя в логах, `/status`, `usage_record` |
 | `base-url` | да | OpenAI-совместимый префикс (без `/chat/completions`) |
-| `api-key` | нет | пустой → провайдер пропускается (`skipped`) |
+| `api-key` | нет | пустой → провайдер пропускается (`skipped`), если не задан `api-key-optional` |
+| `api-key-optional` | нет (false) | `true` — keyless-провайдер: при пустом `api-key` не пропускается, запросы идут без `Authorization` |
 | `model` | да | реальная модель провайдера (подменяет модель клиента) |
 | `priority` | нет (100) | порядок перебора |
 | `timeout` | нет (120s) | таймаут запроса к этому провайдеру (non-stream — весь ответ, stream — до/между чанками); истёк → 504, cooldown и failover |
@@ -163,9 +173,18 @@ gateway:
 | Провайдер | base-url | Модель по умолчанию | priority |
 |---|---|---|---|
 | Groq | `https://api.groq.com/openai/v1` | `openai/gpt-oss-120b` | 1 |
-| SambaNova Cloud | `https://api.sambanova.ai/v1` | `gpt-oss-120b` (Free Tier: 20 RPM / 20 RPD / 200K TPD на модель) | 2 |
-| Z.ai (GLM) | `https://api.z.ai/api/paas/v4` | `glm-4.7-flash` (бесплатная; thinking выключен, timeout 20s) | 3 |
-| OpenRouter | `https://openrouter.ai/api/v1` | `nvidia/nemotron-3-super-120b-a12b:free` | 4 |
+| Z.ai (GLM) | `https://api.z.ai/api/paas/v4` | `glm-4.7-flash` (бесплатная; thinking выключен, timeout 20s) | 2 |
+| Kilo AI Gateway | `https://ai-gateway.kilo.ai/api/v1` | `nvidia/nemotron-3-super-120b-a12b:free` (без ключа: 200 запросов/час на IP; шлюз: 10 RPM / 4800 RPD) | 3 |
+| OVHcloud AI Endpoints | `https://oai.endpoints.kepler.ai.cloud.ovh.net/v1` | `gpt-oss-120b` (без ключа: 2 RPM на IP и модель; с ключом 400 RPM) | 4 |
+| Cloudflare Workers AI | `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1` | `@cf/qwen/qwen3-30b-a3b-fp8` (free: 10 000 Neurons/сутки; 300 RPM) | 5 |
+| OpenRouter | `https://openrouter.ai/api/v1` | `nvidia/nemotron-3-super-120b-a12b:free` | 6 |
+| SambaNova Cloud | `https://api.sambanova.ai/v1` | `gpt-oss-120b` (Free Tier: 20 RPM / 20 RPD / 200K TPD на модель; без карты — 402) | 7 |
+
+> Kilo AI Gateway ([docs](https://kilo.ai/docs/gateway), [Authentication](https://kilo.ai/docs/gateway/authentication)): без ключа доступны только бесплатные модели (`:free`), лимит — 200 запросов в час на IP. `api-key-optional: true`: без `KILO_API_KEY` запросы уходят без заголовка `Authorization`. Модель — `nvidia/nemotron-3-super-120b-a12b:free` (стабильно отвечает без ключа). `kilo-auto/free` не используем: он уводит запрос на случайную free-модель, часть которых тратит весь `max_tokens` на reasoning и возвращает `content: null`. Список моделей: `curl https://ai-gateway.kilo.ai/api/v1/models` (бесплатные — с `:free`).
+
+> OVHcloud AI Endpoints ([Getting started](https://docs.ovhcloud.com/en/guides/public-cloud/ai-machine-learning/ai-endpoints-getting-started)): анонимно — 2 запроса в минуту на IP и на модель, с ключом — 400 в минуту на проект и модель (429 при превышении). OVH присылает `ratelimit-remaining` / `ratelimit-reset`: при остатке 0 шлюз сам ставит паузу до сброса окна. Каталог моделей: `curl https://oai.endpoints.kepler.ai.cloud.ovh.net/v1/models` (без ключа).
+
+> Cloudflare Workers AI ([OpenAI compatibility](https://developers.cloudflare.com/workers-ai/configuration/open-ai-compatibility/), [Pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/), [Limits](https://developers.cloudflare.com/workers-ai/platform/limits/)): нужны `CLOUDFLARE_API_TOKEN` и `CLOUDFLARE_ACCOUNT_ID`. Бесплатно — 10 000 Neurons в сутки; `@cf/qwen/qwen3-30b-a3b-fp8` стоит 4625 neurons / M входных и 30475 / M выходных токенов (≈ 330k выходных токенов в сутки, у `llama-3.3-70b-instruct-fp8-fast` — ≈ 49k). Суточная квота считается в нейронах, поэтому RPD шлюза не задан: исчерпание квоты = ошибка Cloudflare → cooldown и failover. OpenAI-совместимого `GET /models` нет (405) — ping считает такой ответ «доступен».
 
 > SambaNova: OpenAI-совместимый API, `Authorization: Bearer <SAMBANOVA_API_KEY>` ([API keys and URLs](https://docs.sambanova.ai/docs/en/get-started/api-keys-urls), [OpenAI compatibility](https://docs.sambanova.ai/docs/en/features/openai-compatibility)). Лимиты Free Tier по [Rate limits](https://docs.sambanova.ai/docs/en/models/rate-limits): 20 RPM / 20 RPD / 200K токенов в день на каждую модель; заголовки `x-ratelimit-*-requests` (минута) и `x-ratelimit-*-requests-day` (сутки). **Важно:** с августа 2026 SambaCloud без привязанной карты отвечает `402 PAYMENT_METHOD_REQUIRED` (проверено 2026-10-17 на всех моделях из `/v1/models`). Шлюз считает 402 поводом для failover: SambaNova получает cooldown, запрос уходит дальше.
 >
@@ -185,6 +204,7 @@ gateway:
 | `x-ratelimit-remaining-requests`, `x-ratelimit-remaining-tokens` | Groq, OpenAI | сохраняем; requests = 0 → пауза |
 | `x-ratelimit-reset-requests` (`2m59.56s`) | Groq, OpenAI | длительность паузы при requests = 0 |
 | `X-RateLimit-Remaining`, `X-RateLimit-Reset` (epoch ms) | OpenRouter | то же |
+| `ratelimit-remaining`, `ratelimit-reset` (секунды), `x-ratelimit-remaining-minute` | OVHcloud (IETF draft) | то же |
 | `Retry-After` (секунды или HTTP-дата) | все | длительность cooldown после 429/5xx |
 
 ## Подключение клиентов

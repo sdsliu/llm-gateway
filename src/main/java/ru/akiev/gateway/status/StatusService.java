@@ -63,6 +63,11 @@ public class StatusService {
         return m;
     }
 
+    /** Провайдер включён, но api-key не задан — значит, работает в keyless-режиме (api-key-optional). */
+    private boolean keyless(String name) {
+        return props.providers().stream().anyMatch(pp -> pp.name().equals(name) && !pp.hasApiKey());
+    }
+
     public StatusSnapshot snapshot() {
         Instant now = clock.instant();
         Instant dayAgo = now.minus(Duration.ofHours(24));
@@ -88,7 +93,7 @@ public class StatusService {
                     mine.isEmpty() ? null : Math.round(mine.stream().mapToLong(UsageRecord::getLatencyMs).average().orElse(0)),
                     s.lastError(), s.lastErrorAt(), keyInfo(p.name()),
                     s.resetRequestsAt(), s.resetTokensAt(), s.limitsSeenAt(),
-                    health.lastPing(p.name()).orElse(null)));
+                    health.lastPing(p.name()).orElse(null), keyless(p.name())));
         }
         // Провайдеры без ключа тоже показываем — со статусом skipped.
         for (ProviderProperties pp : props.providers()) {
@@ -97,7 +102,7 @@ public class StatusService {
                         null, "api-key не задан", null, null, null,
                         pp.limits() != null ? pp.limits().rpm() : null, null,
                         pp.limits() != null ? pp.limits().rpd() : null,
-                        0, 0, 0, null, null, null, null, null, null, null, null));
+                        0, 0, 0, null, null, null, null, null, null, null, null, false));
             }
         }
         providers.sort((a, b) -> Integer.compare(a.priority(), b.priority()));

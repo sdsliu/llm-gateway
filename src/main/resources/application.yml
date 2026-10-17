@@ -46,7 +46,8 @@ gateway:
     state-check: PT1S       # как часто проверять смену состояния провайдеров
     emitter-timeout: 30m
   # Список провайдеров. priority: меньше = пробуем раньше.
-  # Провайдеры с пустым api-key пропускаются при старте.
+  # Провайдеры с пустым api-key пропускаются при старте — кроме api-key-optional: true (keyless-режим:
+  # запросы уходят без заголовка Authorization; если ключ задан — он используется, лимиты выше).
   # Ключи — только через переменные окружения, в репозиторий не коммитим.
   providers:
     - name: groq
@@ -58,23 +59,6 @@ gateway:
       limits:
         rpm: 30
         rpd: 1000
-    # SambaNova Cloud: OpenAI-совместимый API, Bearer-ключ, https://docs.sambanova.ai
-    # Free Tier (без привязанной карты): 20 RPM / 20 RPD / 200K токенов в день НА МОДЕЛЬ
-    # (https://docs.sambanova.ai/docs/en/models/rate-limits). gpt-oss-120b — production-модель,
-    # проверено по GET https://api.sambanova.ai/v1/models 2026-10-17. Быстрый — ставим перед медленным Z.ai.
-    # ВНИМАНИЕ: с 2026-08 SambaCloud требует карту даже для Free-плана — аккаунт без карты получает
-    # 402 PAYMENT_METHOD_REQUIRED (проверено 2026-10-17 на всех моделях). 402 считается retriable:
-    # cooldown + failover на следующего провайдера, так что без карты провайдер просто «пропускается».
-    # Заголовки лимитов: x-ratelimit-*-requests (минута) и x-ratelimit-*-requests-day (сутки).
-    - name: sambanova
-      base-url: https://api.sambanova.ai/v1
-      api-key: ${SAMBANOVA_API_KEY:}
-      model: gpt-oss-120b
-      priority: 2
-      timeout: 120s
-      limits:
-        rpm: 20
-        rpd: 20
     # Z.ai (Zhipu GLM): OpenAI-совместимый API, https://docs.z.ai/guides/overview/quick-start
     # glm-4.7-flash — бесплатная модель (https://docs.z.ai/guides/overview/pricing).
     # GET /models в документации Z.ai не описан: если он ответит 404/405, ping считает провайдера
@@ -83,7 +67,7 @@ gateway:
       base-url: https://api.z.ai/api/paas/v4
       api-key: ${ZAI_API_KEY:}
       model: glm-4.7-flash
-      priority: 3
+      priority: 2
       # У GLM-4.7 thinking включён по умолчанию и обязателен при enabled: 36-77 с и ~1600 completion-токенов
       # на простой запрос. Отключаем (https://docs.z.ai/guides/capabilities/thinking-mode,
       # https://docs.z.ai/api-reference/llm/chat-completion — ChatThinking.type: enabled|disabled).
@@ -93,6 +77,59 @@ gateway:
       # Короткий таймаут: дольше 20 с ждать нет смысла — клиенты (path-code-ai) отвалятся раньше.
       # Таймаут = 504 -> cooldown (default-cooldown) и failover на openrouter.
       timeout: 20s
+    # Kilo AI Gateway: OpenAI-совместимый, https://kilo.ai/docs/gateway (base URL https://ai-gateway.kilo.ai/api/v1).
+    # Anonymous access (https://kilo.ai/docs/gateway/authentication): без ключа доступны только бесплатные модели,
+    # лимит 200 запросов в час на IP. KILO_API_KEY необязателен (с ключом — по аккаунту Kilo).
+    # nvidia/nemotron-3-super-120b-a12b:free (262k контекст, цена 0) — проверено 2026-10-17 без ключа:
+    # GET /models — 200, POST /chat/completions — 200 стабильно (3-6 с). kilo-auto/free НЕ берём: он каждый раз
+    # уводит запрос на случайную free-модель (dots-studio, reflection/beam, stealth/...), часть из них тратит
+    # весь max_tokens на reasoning и отдаёт content: null, бывали 503 upstream_error.
+    # Лимиты шлюза: 200/час ≈ 3.3/мин в среднем; rpm 10 — запас на всплески, rpd 4800 = 200 × 24.
+    # Заголовков x-ratelimit-* Kilo не присылает: при 429 — cooldown (Retry-After или default-cooldown).
+    - name: kilo
+      base-url: https://ai-gateway.kilo.ai/api/v1
+      api-key: ${KILO_API_KEY:}
+      api-key-optional: true
+      model: nvidia/nemotron-3-super-120b-a12b:free
+      priority: 3
+      timeout: 60s
+      limits:
+        rpm: 10
+        rpd: 4800
+    # OVHcloud AI Endpoints: OpenAI-совместимый, https://docs.ovhcloud.com/en/guides/public-cloud/ai-machine-learning/ai-endpoints-getting-started
+    # Anonymous (без ключа): 2 запроса в минуту на IP и НА МОДЕЛЬ; с ключом (OVH_AI_API_KEY) — 400 в минуту
+    # на Public Cloud проект и модель. Тогда поднимите лимит шлюза: OVH_AI_RPM=400.
+    # gpt-oss-120b (131k контекст) — проверено 2026-10-17: GET /models и POST /chat/completions без ключа — 200.
+    # OVH присылает ratelimit-remaining / ratelimit-reset (сек) — при remaining=0 шлюз сам ставит паузу до сброса.
+    - name: ovh
+      base-url: https://oai.endpoints.kepler.ai.cloud.ovh.net/v1
+      api-key: ${OVH_AI_API_KEY:}
+      api-key-optional: true
+      model: gpt-oss-120b
+      priority: 4
+      timeout: 60s
+      limits:
+        rpm: ${OVH_AI_RPM:2}
+    # Cloudflare Workers AI: OpenAI-совместимые эндпоинты
+    # https://developers.cloudflare.com/workers-ai/configuration/open-ai-compatibility/
+    # Нужны CLOUDFLARE_API_TOKEN (права Workers AI: Read/Edit) и CLOUDFLARE_ACCOUNT_ID; без токена — пропускается.
+    # Free: 10 000 Neurons в сутки (https://developers.cloudflare.com/workers-ai/platform/pricing/), лимит
+    # Text Generation — 300 запросов в минуту (https://developers.cloudflare.com/workers-ai/platform/limits/).
+    # @cf/qwen/qwen3-30b-a3b-fp8 — одна из самых «дешёвых» сильных моделей: 4625 neurons / M input,
+    # 30475 neurons / M output => ~2M входных или ~330k выходных токенов в сутки бесплатно
+    # (для сравнения llama-3.3-70b-instruct-fp8-fast — ~49k выходных). Суточный лимит считается в нейронах,
+    # поэтому rpd не задаём: исчерпание квоты = ошибка от Cloudflare -> cooldown и failover.
+    # Списка моделей в OpenAI-формате нет: GET {base-url}/models отвечает 405 (маршруты /ai/v1/* — только POST),
+    # а ping считает 404/405 «сервер ответил — доступен» (без списка моделей). Поэтому ping-path по умолчанию.
+    # Без CLOUDFLARE_ACCOUNT_ID URL получится битым (/accounts//ai/v1) — задавайте обе переменные.
+    - name: cloudflare
+      base-url: https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID:}/ai/v1
+      api-key: ${CLOUDFLARE_API_TOKEN:}
+      model: "@cf/qwen/qwen3-30b-a3b-fp8"
+      priority: 5
+      timeout: 60s
+      limits:
+        rpm: 300
     # meta-llama/llama-3.3-70b-instruct:free снят с OpenRouter (endpoints: []) -> 404 "No endpoints found".
     # Замена (проверено 2026-10-17 по GET https://openrouter.ai/api/v1/models и /models/{id}/endpoints):
     # nvidia/nemotron-3-super-120b-a12b:free, 262k контекст, tools. Запасные — в fallback-models ниже.
@@ -108,11 +145,29 @@ gateway:
         - google/gemma-4-31b-it:free
         - poolside/laguna-s-2.1:free
         - openrouter/free
-      priority: 4
+      priority: 6
       timeout: 120s
       limits:
         rpm: 20
         rpd: 50
+    # SambaNova Cloud: OpenAI-совместимый API, Bearer-ключ, https://docs.sambanova.ai
+    # Free Tier (без привязанной карты): 20 RPM / 20 RPD / 200K токенов в день НА МОДЕЛЬ
+    # (https://docs.sambanova.ai/docs/en/models/rate-limits). gpt-oss-120b — production-модель,
+    # проверено по GET https://api.sambanova.ai/v1/models 2026-10-17.
+    # ВНИМАНИЕ: с 2026-08 SambaCloud требует карту даже для Free-плана — аккаунт без карты получает
+    # 402 PAYMENT_METHOD_REQUIRED (проверено 2026-10-17 на всех моделях). 402 считается retriable:
+    # cooldown + failover на следующего провайдера, так что без карты провайдер просто «пропускается».
+    # Поэтому стоит последним (priority 7), пока к аккаунту не привязана карта.
+    # Заголовки лимитов: x-ratelimit-*-requests (минута) и x-ratelimit-*-requests-day (сутки).
+    - name: sambanova
+      base-url: https://api.sambanova.ai/v1
+      api-key: ${SAMBANOVA_API_KEY:}
+      model: gpt-oss-120b
+      priority: 7
+      timeout: 120s
+      limits:
+        rpm: 20
+        rpd: 20
 
 management:
   endpoints:

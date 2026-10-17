@@ -20,7 +20,7 @@ import ru.akiev.gateway.dto.ChatResponse;
 import reactor.core.publisher.Flux;
 
 /**
- * Провайдер для любого OpenAI-совместимого API (Groq, Z.ai, OpenRouter, OpenAI, vLLM, Ollama...).
+ * Провайдер для любого OpenAI-совместимого API (Groq, Z.ai, OpenRouter, Kilo, OVHcloud, Cloudflare, vLLM, Ollama...).
  *
  * <p>Почему WebClient, а не RestTemplate/RestClient? WebClient — неблокирующий HTTP-клиент
  * из Spring WebFlux. Сейчас мы используем его в «блокирующем» режиме через block(),
@@ -57,7 +57,8 @@ public class OpenAiCompatibleProvider implements LlmProvider {
         // (иначе baseUrl одного провайдера «протёк» бы в другого).
         this.webClient = builder.clone()
                 .baseUrl(props.baseUrl())
-                .defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + props.apiKey())
+                // Authorization: Bearer — только если ключ задан (keyless-провайдеры ходят без него).
+                .defaultHeaders(props::applyAuth)
                 .defaultHeader(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
                 .build();
     }

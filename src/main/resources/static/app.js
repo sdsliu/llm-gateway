@@ -79,6 +79,7 @@ function renderProviders(list) {
   document.getElementById('providers').innerHTML = list.map(p => {
     return `<div class="card ${p.state}">
       <h3>${esc(p.name)} <span class="badge ${p.state}">${STATE_RU[p.state] ?? p.state}</span>
+        ${p.keyless ? '<span class="badge keyless" title="api-key не задан, провайдер работает анонимно (api-key-optional): лимиты на IP">без ключа</span>' : ''}
         ${p.state !== 'skipped' ? `<button class="btn small" data-ping="${esc(p.name)}">Ping</button>` : ''}</h3>
       <div class="model">${esc(p.model)} · приоритет ${p.priority}</div>
       <div class="kv">

@@ -15,6 +15,8 @@ import org.springframework.http.HttpHeaders;
  *       {@code x-ratelimit-reset-requests} (формат "2m59.56s", "7.66s", "120ms")</li>
  *   <li>OpenRouter: {@code X-RateLimit-Remaining} (трактуем как запросы),
  *       {@code X-RateLimit-Reset} (epoch в миллисекундах)</li>
+ *   <li>OVHcloud AI Endpoints (и другие по IETF draft RateLimit headers): {@code ratelimit-remaining},
+ *       {@code ratelimit-reset} (секунды до сброса), а также {@code x-ratelimit-remaining-minute}</li>
  *   <li>Все: {@code Retry-After} — секунды или HTTP-дата (RFC 1123)</li>
  * </ul>
  * HttpHeaders в Spring регистронезависимы, поэтому "X-RateLimit-Remaining" == "x-ratelimit-remaining".
@@ -27,8 +29,14 @@ public final class RateLimitHeaders {
     }
 
     public static Long remainingRequests(HttpHeaders h) {
-        Long v = parseLong(h.getFirst("x-ratelimit-remaining-requests"));
-        return v != null ? v : parseLong(h.getFirst("x-ratelimit-remaining"));
+        for (String name : new String[] {"x-ratelimit-remaining-requests", "x-ratelimit-remaining",
+                "x-ratelimit-remaining-minute", "ratelimit-remaining"}) {
+            Long v = parseLong(h.getFirst(name));
+            if (v != null) {
+                return v;
+            }
+        }
+        return null;
     }
 
     public static Long remainingTokens(HttpHeaders h) {
@@ -45,6 +53,11 @@ public final class RateLimitHeaders {
         if (epochMs != null && epochMs > 1_000_000_000_000L) {
             Duration left = Duration.between(now, Instant.ofEpochMilli(epochMs));
             return left.isNegative() ? Duration.ZERO : left;
+        }
+        // IETF draft: ratelimit-reset — секунды до сброса окна (OVHcloud: "48")
+        Long seconds = parseLong(h.getFirst("ratelimit-reset"));
+        if (seconds != null && seconds >= 0 && seconds < 1_000_000_000L) {
+            return Duration.ofSeconds(seconds);
         }
         return null;
     }

@@ -31,6 +31,24 @@ class RateLimitHeadersTest {
         assertThat(RateLimitHeaders.resetRequests(h, now)).isEqualTo(Duration.ofSeconds(30));
     }
 
+    /** OVHcloud AI Endpoints (анонимно): IETF draft RateLimit headers, reset — секунды до сброса окна. */
+    @Test
+    void ovhHeaders() {
+        HttpHeaders h = new HttpHeaders();
+        h.add("ratelimit-limit", "2");
+        h.add("ratelimit-remaining", "0");
+        h.add("ratelimit-reset", "48");
+        h.add("x-ratelimit-limit-minute", "2");
+        h.add("x-ratelimit-remaining-minute", "0");
+        assertThat(RateLimitHeaders.remainingRequests(h)).isEqualTo(0);
+        assertThat(RateLimitHeaders.resetRequests(h, now)).isEqualTo(Duration.ofSeconds(48));
+
+        HttpHeaders only = new HttpHeaders();
+        only.add("ratelimit-remaining", "1");
+        assertThat(RateLimitHeaders.remainingRequests(only)).isEqualTo(1);
+        assertThat(RateLimitHeaders.resetRequests(only, now)).isNull();
+    }
+
     @Test
     void retryAfterSecondsAndDate() {
         HttpHeaders h = new HttpHeaders();
