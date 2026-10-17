@@ -23,7 +23,10 @@ public record ChatRequest(
         @JsonProperty("presence_penalty") Double presencePenalty,
         @JsonProperty("frequency_penalty") Double frequencyPenalty,
         String user,
-        @JsonProperty("stream_options") StreamOptions streamOptions) {
+        @JsonProperty("stream_options") StreamOptions streamOptions,
+        // gpt-oss / o-серии: low | medium | high. Пробрасываем как есть — меньше токенов на рассуждения
+        // (у Groq без max_tokens ответ обрезается на 3072 токенах, рассуждения съедают большую часть).
+        @JsonProperty("reasoning_effort") String reasoningEffort) {
 
     /** stream_options: {"include_usage": true} — попросить провайдера прислать usage последним чанком. */
     public record StreamOptions(@JsonProperty("include_usage") Boolean includeUsage) {
@@ -32,7 +35,8 @@ public record ChatRequest(
     /** Конструктор без stream_options (для удобства в коде и тестах). */
     public ChatRequest(String model, List<Message> messages, Boolean stream, Double temperature, Double topP,
             Integer maxTokens, List<String> stop, Double presencePenalty, Double frequencyPenalty, String user) {
-        this(model, messages, stream, temperature, topP, maxTokens, stop, presencePenalty, frequencyPenalty, user, null);
+        this(model, messages, stream, temperature, topP, maxTokens, stop, presencePenalty, frequencyPenalty, user, null,
+                null);
     }
 
     /** Не getter-имя (isStream) намеренно: иначе Jackson спутает его с полем stream. */
@@ -48,18 +52,19 @@ public record ChatRequest(
     /** Копия запроса с подменённой моделью (override модели провайдера). */
     public ChatRequest withModel(String newModel) {
         return new ChatRequest(newModel, messages, stream, temperature, topP, maxTokens, stop,
-                presencePenalty, frequencyPenalty, user, streamOptions);
+                presencePenalty, frequencyPenalty, user, streamOptions, reasoningEffort);
     }
 
     /** Копия с stream=false (stream_options без stream провайдеры отвергают — убираем). */
     public ChatRequest withoutStream() {
         return new ChatRequest(model, messages, false, temperature, topP, maxTokens, stop,
-                presencePenalty, frequencyPenalty, user, null);
+                presencePenalty, frequencyPenalty, user, null, reasoningEffort);
     }
 
     /** Копия с stream=true; includeUsage=true добавляет stream_options.include_usage. */
     public ChatRequest withStream(boolean includeUsage) {
         return new ChatRequest(model, messages, true, temperature, topP, maxTokens, stop,
-                presencePenalty, frequencyPenalty, user, includeUsage ? new StreamOptions(true) : streamOptions);
+                presencePenalty, frequencyPenalty, user, includeUsage ? new StreamOptions(true) : streamOptions,
+                reasoningEffort);
     }
 }

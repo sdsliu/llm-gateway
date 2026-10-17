@@ -37,4 +37,17 @@ class DtoJsonTest {
                 null, null, null, null, null, null, null, null));
         assertThat(req).doesNotContain("null").doesNotContain("temperature");
     }
+
+    @Test
+    void reasoningEffortIsPassedThroughAndSurvivesCopies() throws Exception {
+        ChatRequest r = mapper.readValue("""
+                {"model":"m","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"low"}
+                """, ChatRequest.class);
+        assertThat(r.reasoningEffort()).isEqualTo("low");
+        assertThat(r.withModel("x").withStream(true).withoutStream().reasoningEffort()).isEqualTo("low");
+        assertThat(mapper.writeValueAsString(r.withModel("provider-model"))).contains("\"reasoning_effort\":\"low\"");
+        String none = mapper.writeValueAsString(new ChatRequest("m", List.of(new Message("user", "x")),
+                null, null, null, null, null, null, null, null));
+        assertThat(none).doesNotContain("reasoning_effort");
+    }
 }
