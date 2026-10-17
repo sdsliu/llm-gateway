@@ -8,7 +8,10 @@ import jakarta.persistence.Id;
 import jakarta.persistence.Table;
 import java.time.Instant;
 
-/** Одна попытка обращения к провайдеру. Схема — db/migration/V1__usage_record.sql. */
+/**
+ * Одна попытка обращения к провайдеру. Схема — db/migration/V1__usage_record.sql,
+ * метки запроса (run_id, issue, client, request_user) — V2__usage_record_tags.sql.
+ */
 @Entity
 @Table(name = "usage_record")
 public class UsageRecord {
@@ -30,6 +33,12 @@ public class UsageRecord {
     private String error;
     @Column(name = "created_at")
     private Instant createdAt;
+    @Column(name = "run_id")
+    private String runId;
+    private String issue;
+    private String client;
+    @Column(name = "request_user")
+    private String requestUser;
 
     protected UsageRecord() {
         // для JPA
@@ -48,6 +57,18 @@ public class UsageRecord {
         this.createdAt = createdAt;
     }
 
+    /** То же + метки клиентского запроса (x-run-id, x-issue, x-client, user). */
+    public UsageRecord(String provider, String model, Integer promptTokens, Integer completionTokens,
+            Integer totalTokens, int status, long latencyMs, String error, Instant createdAt, RequestTags tags) {
+        this(provider, model, promptTokens, completionTokens, totalTokens, status, latencyMs, error, createdAt);
+        if (tags != null) {
+            this.runId = tags.runId();
+            this.issue = tags.issue();
+            this.client = tags.client();
+            this.requestUser = tags.user();
+        }
+    }
+
     public Long getId() { return id; }
     public String getProvider() { return provider; }
     public String getModel() { return model; }
@@ -58,6 +79,10 @@ public class UsageRecord {
     public long getLatencyMs() { return latencyMs; }
     public String getError() { return error; }
     public Instant getCreatedAt() { return createdAt; }
+    public String getRunId() { return runId; }
+    public String getIssue() { return issue; }
+    public String getClient() { return client; }
+    public String getRequestUser() { return requestUser; }
 
     public boolean isSuccess() {
         return status >= 200 && status < 300;

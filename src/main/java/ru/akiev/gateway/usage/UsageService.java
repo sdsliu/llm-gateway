@@ -11,7 +11,10 @@ import ru.akiev.gateway.provider.LlmProvider;
 import ru.akiev.gateway.provider.ProviderException;
 import ru.akiev.gateway.router.RouterListener;
 
-/** Сохраняет каждую попытку в usage_record и публикует событие для дашборда. */
+/**
+ * Сохраняет каждую попытку в usage_record и публикует событие для дашборда.
+ * Метки запроса (x-run-id и др.) берутся из {@link RequestTags#current()} — их привязывает ChatController.
+ */
 @Service
 public class UsageService implements RouterListener {
 
@@ -36,14 +39,15 @@ public class UsageService implements RouterListener {
                 u != null ? u.promptTokens() : null,
                 u != null ? u.completionTokens() : null,
                 u != null ? u.totalTokens() : null,
-                200, latencyMs, null, clock.instant()));
+                200, latencyMs, null, clock.instant(), RequestTags.current()));
     }
 
     @Override
     public void onFailure(LlmProvider provider, ProviderException error, long latencyMs) {
         provider.state().recordError(clock.instant(), "HTTP " + error.status());
         save(new UsageRecord(provider.name(), provider.models().stream().findFirst().orElse(null),
-                null, null, null, error.status(), latencyMs, error.getMessage(), clock.instant()));
+                null, null, null, error.status(), latencyMs, error.getMessage(), clock.instant(),
+                RequestTags.current()));
     }
 
     private void save(UsageRecord r) {

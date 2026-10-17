@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LLM Gateway — эффективность</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="icon" href="data:,">
+</head>
+<body>
+<header>
+  <h1>Эффективность</h1>
+  <nav><a href="/">← Дашборд</a></nav>
+</header>
+
+<p class="hint" style="margin-top:12px">Сколько запросов и токенов потратила каждая задача (по заголовку <code>x-run-id</code>),
+  чем закончился прогон ai-runner (PR, попытки, длительность) и сколько бы это стоило на платной модели.
+  Итоги прогонов берутся из <code>GET /stats</code> spring-runner (<code>gateway.efficiency.runner-stats-url</code>).</p>
+
+<label class="hint">Период:
+  <select id="days" class="btn"><option value="1">сутки</option><option value="7">7 дней</option>
+    <option value="30" selected>30 дней</option><option value="90">90 дней</option></select>
+  <button id="refresh" class="btn">Обновить</button>
+</label>
+
+<section class="totals">
+  <div class="total"><span id="s-runs">—</span><small>прогонов ai-runner (завершённых)</small></div>
+  <div class="total"><span id="s-rate">—</span><small>успешных (PR, тесты зелёные)</small></div>
+  <div class="total"><span id="s-tok">—</span><small>токенов на успешный прогон</small></div>
+  <div class="total"><span id="s-cost">—</span><small id="s-cost-label">оценка стоимости</small></div>
+</section>
+<p id="note" class="note"></p>
+<p id="runner" class="hint"></p>
+
+<h2>Прогоны ai-runner</h2>
+<table>
+  <thead><tr><th>Run</th><th>Issue</th><th>Статус</th><th>Попытки</th><th>Длительность</th><th>Запросов</th>
+    <th>Ошибок</th><th>Токенов</th><th>Оценка</th><th>PR</th></tr></thead>
+  <tbody id="runs"><tr><td colspan="10" class="muted">Загрузка…</td></tr></tbody>
+</table>
+
+<h2>Другие агенты и клиенты <select id="group" class="btn small"><option value="client">по клиенту</option>
+  <option value="run">по run_id</option><option value="issue">по issue</option></select></h2>
+<table>
+  <thead><tr><th>Ключ</th><th>Клиенты</th><th>Запросов</th><th>Ошибок</th><th>Prompt</th><th>Completion</th>
+    <th>Провайдеры</th><th>Первый</th><th>Последний</th><th>Оценка</th></tr></thead>
+  <tbody id="groups"><tr><td colspan="10" class="muted">Загрузка…</td></tr></tbody>
+</table>
+
+<footer>JSON: <a href="/stats/efficiency">/stats/efficiency</a> · <a href="/stats/runs?groupBy=client">/stats/runs</a>.
+  Стоимость — <b>оценка</b> по справочным ценам из <code>gateway.pricing</code>, а не реальные расходы.</footer>
+<script src="efficiency.js"></script>
+</body>
+</html>

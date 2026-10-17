@@ -169,6 +169,28 @@ gateway:
         rpm: 20
         rpd: 20
 
+  # Дашборд «Эффективность» (/efficiency.html, GET /stats/efficiency): откуда брать итоги прогонов ai-runner.
+  # Необязательно: если spring-runner не запущен, страница покажет только данные шлюза. Пусто — не спрашивать.
+  # В docker-compose с hostnet localhost — это хост, где на 8085 работает spring-runner.
+  efficiency:
+    runner-stats-url: ${RUNNER_STATS_URL:http://localhost:8085/stats}
+  # Справочные цены ПЛАТНЫХ моделей за 1M токенов — только для ОЦЕНКИ «сколько бы это стоило».
+  # Шлюз ходит к бесплатным провайдерам, реальных расходов нет. Цены меняются — сверяйте с прайсом провайдера
+  # (значения ниже — примерные публичные цены этих моделей на 2025 год; проверьте актуальный прайс и поправьте).
+  pricing:
+    currency: USD
+    note: "Оценка: сколько стоили бы эти токены на платной модели (справочные цены за 1M токенов, не реальный счёт)"
+    models:
+      - name: gpt-4o
+        input-per-million: 2.50
+        output-per-million: 10.00
+      - name: claude-sonnet
+        input-per-million: 3.00
+        output-per-million: 15.00
+      - name: gpt-4o-mini
+        input-per-million: 0.15
+        output-per-million: 0.60
+
 management:
   endpoints:
     web:

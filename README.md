@@ -268,6 +268,40 @@ print(client.chat.completions.create(model="openai/coder",
   ```
 - **`GET /actuator/health`**: healthcheck.
 
+## Эффективность: учёт по прогонам (`/stats/runs`, `/stats/efficiency`)
+
+Клиенты помечают запросы заголовками — шлюз сохраняет их в `usage_record`
+(миграция `V2__usage_record_tags.sql`, колонки `run_id`, `issue`, `client`, `request_user`):
+
+| Заголовок / поле | Кто шлёт | Пример |
+|---|---|---|
+| `x-run-id` | ai-runner, project-sage | `20261017-101500-42` |
+| `x-issue` | ai-runner, project-sage | `42` |
+| `x-client` | ai-runner, project-sage | `ai-runner` |
+| поле `user` в теле | любой OpenAI-клиент | `project-sage` |
+
+Все метки необязательны; без них запрос учитывается как раньше (группа «(без метки)»).
+
+```bash
+# агрегаты: запросы, prompt/completion токены, провайдеры, первый/последний запрос, ошибки, оценка стоимости
+curl -s 'localhost:4000/stats/runs?groupBy=run&days=30&limit=200'   # groupBy = run | issue | client
+# склейка с итогами ai-runner (успех, попытки, PR, категория ошибки)
+curl -s 'localhost:4000/stats/efficiency?days=30'
+```
+
+Страница **«Эффективность»** — `http://localhost:4000/efficiency.html` (ссылка в шапке дашборда):
+доля успешных прогонов, токены на один успешный прогон, оценка стоимости, таблица прогонов и группировки.
+
+**Как склеиваются данные.** Выбран простой вариант: шлюз сам делает GET к `ai-runner` `/stats`
+(`RUNNER_STATS_URL`, по умолчанию `http://localhost:8085/stats`) и соединяет по `run_id`.
+Зависимость односторонняя (шлюз → runner), runner о шлюзе ничего не знает, новых таблиц и
+синхронизации нет. Если runner не запущен — страница работает, показывая только данные шлюза
+(`runner_available: false`). Прогоны без итога runner (например, project-sage) попадают в `other`.
+
+**Стоимость — это ОЦЕНКА.** Бесплатные провайдеры ничего не стоят; таблица `gateway.pricing.models`
+в `application.yml` показывает, «сколько стоили бы те же токены» на платной модели (цена за 1M
+входных/выходных токенов). Цены приблизительные — проверяйте у провайдера.
+
 ## Режим роутинга (priority / round-robin)
 
 | Режим | Порядок перебора |
