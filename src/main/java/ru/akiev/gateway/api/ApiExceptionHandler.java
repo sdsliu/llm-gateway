@@ -8,6 +8,7 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 import ru.akiev.gateway.dto.ErrorResponse;
 import ru.akiev.gateway.provider.ProviderException;
 import ru.akiev.gateway.router.AllProvidersUnavailableException;
+import ru.akiev.gateway.router.RequestTooLargeException;
 
 /** Ошибки в формате OpenAI. */
 @RestControllerAdvice
@@ -37,5 +38,11 @@ public class ApiExceptionHandler {
     public ResponseEntity<ErrorResponse> allDown(AllProvidersUnavailableException e) {
         return ResponseEntity.status(503)
                 .body(ErrorResponse.of(e.getMessage(), "service_unavailable", "all_providers_unavailable"));
+    }
+
+    @ExceptionHandler(RequestTooLargeException.class)
+    public ResponseEntity<ErrorResponse> tooLarge(RequestTooLargeException e) {
+        return ResponseEntity.status(413)
+                .body(ErrorResponse.of(e.getMessage(), "request_too_large", "request_too_large"));
     }
 }

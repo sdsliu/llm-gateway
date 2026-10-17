@@ -134,6 +134,8 @@ public class ProviderRouter {
 
     public ChatResponse chat(ChatRequest request) {
         List<String> failures = new ArrayList<>();
+        List<String> tooLarge = new ArrayList<>();
+        int attempted = 0;
         for (LlmProvider p : order(true)) {
             Instant now = clock.instant();
             if (!p.state().isAvailable(now)) {
@@ -154,6 +156,10 @@ public class ProviderRouter {
                     throw e;
                 }
             } catch (ProviderException e) {
+                if (e.isRequestTooLarge()) {
+                    tooLarge(p, e, tooLarge, failures);
+                    continue;
+                }
                 if (!e.isRetriable()) {
                     // 400/404 и т.п. — не failover, но обязательно в лог (например, OpenRouter 404
                     // «No endpoints found» для снятой :free модели).
@@ -162,11 +168,13 @@ public class ProviderRouter {
                 }
                 Duration cd = e.retryAfter() != null ? e.retryAfter() : defaultCooldown;
                 p.state().cooldown(clock.instant().plus(cd), "HTTP " + e.status());
+                attempted++;
                 log.warn("Failover: {} ответил {} — cooldown {}, пробуем следующего. {}",
                         p.name(), e.status(), cd, snippet(e.getMessage()));
                 failures.add(p.name() + ": HTTP " + e.status());
             }
         }
+        throwIfAllTooLarge(tooLarge, attempted);
         throw new AllProvidersUnavailableException(
                 "All providers are unavailable" + (failures.isEmpty() ? "" : " (" + String.join(", ", failures) + ")"));
     }
@@ -191,6 +199,8 @@ public class ProviderRouter {
      */
     public StreamSession openStream(ChatRequest request) {
         List<String> failures = new ArrayList<>();
+        List<String> tooLarge = new ArrayList<>();
+        int attempted = 0;
         for (LlmProvider p : order(true)) {
             if (!p.state().isAvailable(clock.instant())) {
                 failures.add(p.name() + ": unavailable");
@@ -210,6 +220,10 @@ public class ProviderRouter {
             } catch (ProviderException e) {
                 stream.close();
                 listener.onFailure(p, e, (System.nanoTime() - start) / 1_000_000);
+                if (e.isRequestTooLarge()) {
+                    tooLarge(p, e, tooLarge, failures);
+                    continue;
+                }
                 if (!e.isRetriable()) {
                     // 400/404 и т.п. — не failover, но обязательно в лог (например, OpenRouter 404
                     // «No endpoints found» для снятой :free модели).
@@ -218,16 +232,37 @@ public class ProviderRouter {
                 }
                 Duration cd = e.retryAfter() != null ? e.retryAfter() : defaultCooldown;
                 p.state().cooldown(clock.instant().plus(cd), "HTTP " + e.status());
+                attempted++;
                 log.warn("Failover (стрим, до первого чанка): {} ответил {} — cooldown {}. {}", p.name(), e.status(), cd,
                         snippet(e.getMessage()));
                 failures.add(p.name() + ": HTTP " + e.status());
             }
         }
+        throwIfAllTooLarge(tooLarge, attempted);
         throw new AllProvidersUnavailableException(
                 "All providers are unavailable" + (failures.isEmpty() ? "" : " (" + String.join(", ", failures) + ")"));
     }
 
     private static final int STREAM_PREFETCH = 32;
+
+    /** 413 / «Request too large»: без cooldown (провайдер исправен) и без повтора — сразу к следующему. */
+    private static void tooLarge(LlmProvider p, ProviderException e, List<String> tooLarge, List<String> failures) {
+        log.warn("Провайдер {}: запрос слишком большой (HTTP {}) — без cooldown, пробуем следующего. {}",
+                p.name(), e.status(), snippet(e.getMessage()));
+        tooLarge.add(p.name());
+        failures.add(p.name() + ": request too large");
+    }
+
+    /**
+     * Все провайдеры, к которым реально ходили, ответили «слишком большой запрос» — это ошибка клиента (4xx),
+     * а не недоступность: повтор того же запроса не поможет. Текст провайдера (с id организации) не пробрасываем.
+     */
+    private static void throwIfAllTooLarge(List<String> tooLarge, int otherAttempted) {
+        if (!tooLarge.isEmpty() && otherAttempted == 0) {
+            throw new RequestTooLargeException("Request too large for all available providers ("
+                    + String.join(", ", tooLarge) + "). Reduce the prompt size or split the task.");
+        }
+    }
 
     /** Короткий фрагмент ошибки для логов (тело ответа провайдера, без заголовков и ключей). */
     static String snippet(String msg) {
