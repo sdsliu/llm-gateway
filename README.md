@@ -159,7 +159,9 @@ gateway:
 |---|---|---|---|
 | Groq | `https://api.groq.com/openai/v1` | `openai/gpt-oss-120b` | 1 |
 | Z.ai (GLM) | `https://api.z.ai/api/paas/v4` | `glm-4.7-flash` (бесплатная) | 2 |
-| OpenRouter | `https://openrouter.ai/api/v1` | `meta-llama/llama-3.3-70b-instruct:free` | 3 |
+| OpenRouter | `https://openrouter.ai/api/v1` | `nvidia/nemotron-3-super-120b-a12b:free` | 3 |
+
+> OpenRouter: бесплатные модели периодически снимают — тогда OpenRouter отвечает 404 «No endpoints found». Актуальный список: `curl https://openrouter.ai/api/v1/models` (id с `:free`). Тот же 404 бывает, если в https://openrouter.ai/settings/privacy запрещены провайдеры, обучающиеся на запросах (free-модели их требуют).
 
 Подойдёт любой OpenAI-совместимый сервер (OpenAI, Together, vLLM, Ollama `http://localhost:11434/v1` и т. д.):
 достаточно добавить элемент в список.

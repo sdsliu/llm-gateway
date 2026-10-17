@@ -132,11 +132,12 @@ public class ProviderHealthService {
             return Mono.just(r);
         }
         long start = System.nanoTime();
-        String path = providers.get(name).pingPath();
-        return client.get().uri(path == null || path.isBlank() ? "/models" : path).retrieve().toEntity(String.class)
+        String path = pingPath(providers.get(name));
+        String url = pingUrl(providers.get(name));
+        return client.get().uri(path).retrieve().toEntity(String.class)
                 .timeout(timeout)
                 .map(e -> onSuccess(name, e, start))
-                .onErrorResume(e -> Mono.just(onError(name, e, start)))
+                .onErrorResume(e -> Mono.just(onError(name, url, e, start)))
                 .doOnNext(r -> lastPing.put(name, r));
     }
 
@@ -153,7 +154,30 @@ public class ProviderHealthService {
         return new PingResult(name, "up", ms, e.getStatusCode().value(), null, clock.instant(), ids.size());
     }
 
-    private PingResult onError(String name, Throwable e, long start) {
+    static String snippet(String body) {
+        if (body == null) {
+            return "";
+        }
+        String b = body.replaceAll("\\s+", " ").trim();
+        return b.length() > 200 ? b.substring(0, 200) + "…" : b;
+    }
+
+    /** ping-path с ведущим слэшем (по умолчанию /models), чтобы он дописывался к base-url, а не заменял его. */
+    static String pingPath(ProviderProperties p) {
+        String path = p.pingPath() == null || p.pingPath().isBlank() ? "/models" : p.pingPath().trim();
+        return path.startsWith("/") ? path : "/" + path;
+    }
+
+    /** Полный URL ping для логов (без ключа: ключ идёт только в заголовке). */
+    static String pingUrl(ProviderProperties p) {
+        String base = p.baseUrl().trim();
+        while (base.endsWith("/")) {
+            base = base.substring(0, base.length() - 1);
+        }
+        return base + pingPath(p);
+    }
+
+    private PingResult onError(String name, String url, Throwable e, long start) {
         long ms = (System.nanoTime() - start) / 1_000_000;
         Integer status = null;
         String error;
@@ -162,6 +186,10 @@ public class ProviderHealthService {
             // 2xx здесь = ошибка чтения/декодирования тела; 404/405 = нет эндпоинта списка моделей.
             // Сервер ответил и ключ не отвергнут — считаем провайдера доступным.
             int st = w.getStatusCode().value();
+            if (st >= 300) {
+                log.warn("Ping {} GET {} -> HTTP {} (считаем up, список моделей недоступен): {}", name, url, st,
+                        snippet(w.getResponseBodyAsString()));
+            }
             String note = st < 300 ? "не удалось прочитать список моделей" : "список моделей не поддерживается (HTTP " + st + ")";
             models.compute(name, (k, old) -> new ModelsCache(old != null ? old.models() : List.of(),
                     old != null ? old.fetchedAt() : null, note, clock.instant()));
@@ -170,13 +198,13 @@ public class ProviderHealthService {
         if (e instanceof WebClientResponseException w) {
             status = w.getStatusCode().value();
             String body = w.getResponseBodyAsString();
-            error = "HTTP " + status + (body.isBlank() ? "" : ": " + body.substring(0, Math.min(200, body.length())));
+            error = "HTTP " + status + (body.isBlank() ? "" : ": " + snippet(body));
         } else if (e instanceof TimeoutException) {
             error = "таймаут " + timeout.toSeconds() + " с";
         } else {
             error = e.getClass().getSimpleName() + (e.getMessage() != null ? ": " + e.getMessage() : "");
         }
-        log.warn("Ping {} не прошёл: {}", name, status != null ? "HTTP " + status : e.getClass().getSimpleName());
+        log.warn("Ping {} GET {} не прошёл: {}", name, url, error);
         models.compute(name, (k, old) -> new ModelsCache(old != null ? old.models() : List.of(),
                 old != null ? old.fetchedAt() : null, error, clock.instant()));
         return new PingResult(name, "down", ms, status, error, clock.instant(), null);

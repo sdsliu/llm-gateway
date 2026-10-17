@@ -110,4 +110,39 @@ class ProviderHealthPingTest {
         assertThat(ProviderHealthService.parseIds("[{\"id\":\"m1\"},\"m2\"]")).containsExactly("m1", "m2");
         assertThat(ProviderHealthService.parseIds("not json")).isNull();
     }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"/models", "models", " /models "})
+    void pingPathIsAppendedToApiV1(String pingPath) throws InterruptedException {
+        server.enqueue(new MockResponse().setBody("{\"data\":[]}"));
+        service(pingPath).ping("openrouter");
+        assertThat(server.takeRequest().getPath()).isEqualTo("/api/v1/models");
+    }
+
+    @Test
+    void pingUrlForRealOpenRouterConfig() {
+        for (String base : List.of("https://openrouter.ai/api/v1", "https://openrouter.ai/api/v1/")) {
+            var p = new ProviderProperties("openrouter", base, "secret", "m", 1, Duration.ofSeconds(5), null, true,
+                    "/models");
+            assertThat(ProviderHealthService.pingUrl(p)).isEqualTo("https://openrouter.ai/api/v1/models");
+        }
+    }
+
+    @Test
+    void failedPingLogsWarnWithUrlStatusAndBodyButNoKey() {
+        var logger = (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(ProviderHealthService.class);
+        var appender = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            server.enqueue(new MockResponse().setResponseCode(401).setBody("{\"error\":\"bad key\"}"));
+            service("/models").ping("openrouter");
+            var warn = appender.list.stream().filter(e -> e.getLevel() == ch.qos.logback.classic.Level.WARN)
+                    .map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage).findFirst().orElseThrow();
+            assertThat(warn).contains("openrouter", server.url("/api/v1/models").toString(), "HTTP 401", "bad key")
+                    .doesNotContain("secret");
+        } finally {
+            logger.detachAppender(appender);
+        }
+    }
 }

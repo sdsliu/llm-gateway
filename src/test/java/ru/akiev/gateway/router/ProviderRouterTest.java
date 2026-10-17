@@ -188,4 +188,22 @@ class ProviderRouterTest {
         primary.enqueue(json(ok("third")));
         assertThat(answer()).isEqualTo("third");
     }
+
+    @Test
+    void nonRetriable404IsLoggedAtWarnWithBody() {
+        var logger = (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(ProviderRouter.class);
+        var appender = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            primary.enqueue(new MockResponse().setResponseCode(404)
+                    .setBody("{\"error\":{\"message\":\"No endpoints found for meta-llama/llama-3.3-70b-instruct:free.\",\"code\":404}}"));
+            org.assertj.core.api.Assertions.assertThatThrownBy(this::answer).isInstanceOf(ProviderException.class);
+            var warn = appender.list.stream().filter(e -> e.getLevel() == ch.qos.logback.classic.Level.WARN)
+                    .map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage).findFirst().orElseThrow();
+            assertThat(warn).contains("primary", "404", "No endpoints found").doesNotContain("k-primary");
+        } finally {
+            logger.detachAppender(appender);
+        }
+    }
 }

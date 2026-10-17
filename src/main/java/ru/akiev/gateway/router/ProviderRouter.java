@@ -82,12 +82,15 @@ public class ProviderRouter {
                 }
             } catch (ProviderException e) {
                 if (!e.isRetriable()) {
+                    // 400/404 и т.п. — не failover, но обязательно в лог (например, OpenRouter 404
+                    // «No endpoints found» для снятой :free модели).
+                    log.warn("Провайдер {} ответил {} (без failover): {}", p.name(), e.status(), snippet(e.getMessage()));
                     throw e;
                 }
                 Duration cd = e.retryAfter() != null ? e.retryAfter() : defaultCooldown;
                 p.state().cooldown(clock.instant().plus(cd), "HTTP " + e.status());
                 log.warn("Failover: {} ответил {} — cooldown {}, пробуем следующего. {}",
-                        p.name(), e.status(), cd, e.getMessage());
+                        p.name(), e.status(), cd, snippet(e.getMessage()));
                 failures.add(p.name() + ": HTTP " + e.status());
             }
         }
@@ -135,11 +138,15 @@ public class ProviderRouter {
                 stream.close();
                 listener.onFailure(p, e, (System.nanoTime() - start) / 1_000_000);
                 if (!e.isRetriable()) {
+                    // 400/404 и т.п. — не failover, но обязательно в лог (например, OpenRouter 404
+                    // «No endpoints found» для снятой :free модели).
+                    log.warn("Провайдер {} ответил {} (без failover): {}", p.name(), e.status(), snippet(e.getMessage()));
                     throw e;
                 }
                 Duration cd = e.retryAfter() != null ? e.retryAfter() : defaultCooldown;
                 p.state().cooldown(clock.instant().plus(cd), "HTTP " + e.status());
-                log.warn("Failover (стрим, до первого чанка): {} ответил {} — cooldown {}", p.name(), e.status(), cd);
+                log.warn("Failover (стрим, до первого чанка): {} ответил {} — cooldown {}. {}", p.name(), e.status(), cd,
+                        snippet(e.getMessage()));
                 failures.add(p.name() + ": HTTP " + e.status());
             }
         }
@@ -148,4 +155,13 @@ public class ProviderRouter {
     }
 
     private static final int STREAM_PREFETCH = 32;
+
+    /** Короткий фрагмент ошибки для логов (тело ответа провайдера, без заголовков и ключей). */
+    static String snippet(String msg) {
+        if (msg == null) {
+            return "";
+        }
+        String m = msg.replaceAll("\\s+", " ").trim();
+        return m.length() > 300 ? m.substring(0, 300) + "…" : m;
+    }
 }
