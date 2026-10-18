@@ -90,7 +90,8 @@ public class OpenAiCompatibleProvider implements LlmProvider {
         // Override модели: клиент может прислать любое имя (например "openai/coder" от Aider),
         // а провайдеру уходит реальная модель из конфигурации.
         ChatRequest outgoing = request.withoutStream();
-        if (props.model() != null && !props.model().isBlank() && (request.model() == null || !props.models().contains(request.model()))) {
+        if (props.model() != null && !props.model().isBlank()
+                && (request.model() == null || !props.models().contains(request.model()))) {
             // Модель из списка models уходит как есть, всё остальное заменяем на основную модель провайдера.
             outgoing = outgoing.withModel(props.model());
         }
@@ -172,7 +173,8 @@ public class OpenAiCompatibleProvider implements LlmProvider {
     @Override
     public Flux<String> chatStream(ChatRequest request) {
         ChatRequest outgoing = request.withStream(props.streamUsage());
-        if (props.model() != null && !props.model().isBlank() && (request.model() == null || !props.models().contains(request.model()))) {
+        if (props.model() != null && !props.model().isBlank()
+                && (request.model() == null || !props.models().contains(request.model()))) {
             // Модель из списка models уходит как есть, всё остальное заменяем на основную модель провайдера.
             outgoing = outgoing.withModel(props.model());
         }
