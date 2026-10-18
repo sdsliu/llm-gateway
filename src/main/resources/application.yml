@@ -29,10 +29,23 @@ gateway:
   # (таблица routing_settings) — переживает рестарт и имеет приоритет над этим блоком.
   # «Сбросить к настройкам из конфига» (DELETE /status/routing) удаляет сохранённое — снова действует этот блок.
   #   priority    — по priority; если задан primary, он идёт первым, остальные — по priority;
-  #   round-robin — по кругу среди доступных сейчас (без cooldown/лимита), при ошибке — следующий.
+  #   round-robin — по кругу среди доступных сейчас (без cooldown/лимита), при ошибке — следующий;
+  #   headroom    — к тому, у кого больше всего запаса по лимитам (RPM/RPD/TPM/сутки/месяц) под этот запрос.
+  # Во всех режимах провайдер без места под запрос пропускается (см. gateway.limits ниже).
   routing:
-    mode: priority
+    mode: headroom
     primary:               # имя провайдера из списка ниже; пусто — чистый приоритет
+  # Маршрутизация по лимитам (issue #34). Лимиты провайдера узнаём у него самого (при старте и из заголовков
+  # ответов); gateway.providers[].limits — только запасной вариант. Подробности — README, «Лимиты провайдеров».
+  limits:
+    startup-probe: true     # опросить провайдеров ДО приёма запросов; не ответивших — исключить из роутинга
+    probe-timeout: PT10S    # таймаут опроса одного провайдера (старт не зависнет)
+    reprobe-interval: PT1M  # как часто перепинговывать исключённых и поставленных на паузу после 429
+    refresh-interval: PT30M # как часто обновлять лимиты из API (OpenRouter /key, Gonka /test-auth)
+    max-wait: PT20S         # места нет ни у кого — ждать до этого времени, потом 429 rate_limit_exceeded
+    default-max-tokens: 1024 # оценка выхода, если клиент не прислал max_tokens
+    pin-model-per-run: false # true — все запросы с одним x-run-id идут к одному провайдеру, пока он доступен
+    pin-ttl: PT12H
   openrouter:
     name: openrouter        # какой провайдер из списка опрашивать через GET /key
     poll-interval: PT5M  # ISO-8601
@@ -57,9 +70,11 @@ gateway:
       model: openai/gpt-oss-120b
       priority: 1
       timeout: 120s
+      # Fallback: при старте Groq сообщает реальные лимиты в x-ratelimit-* (limit-requests = RPD, limit-tokens = TPM).
       limits:
         rpm: 30
         rpd: 1000
+        tpm: 8000
     # Z.ai (Zhipu GLM): OpenAI-совместимый API, https://docs.z.ai/guides/overview/quick-start
     # glm-4.7-flash — бесплатная модель (https://docs.z.ai/guides/overview/pricing).
     # GET /models в документации Z.ai не описан: если он ответит 404/405, ping считает провайдера
@@ -169,6 +184,19 @@ gateway:
       limits:
         rpm: 20
         rpd: 20
+        tokens-per-day: 200000
+    # Gonka Broker (пример, выключен): лимиты берутся из GET /test-auth (maxRpm), квота ~1M токенов в месяц.
+    # Если /test-auth лежит не под base-url — укажите полный адрес в limits-probe-url.
+    # - name: gonka
+    #   base-url: https://<broker>/v1
+    #   api-key: ${GONKA_API_KEY:}
+    #   model: <model>
+    #   priority: 8
+    #   limits-probe: gonka
+    #   limits-probe-url: https://<broker>/test-auth
+    #   limits:
+    #     rpm: 6
+    #     tokens-per-month: 1000000
 
   # Дашборд «Эффективность» (/efficiency.html, GET /stats/efficiency): откуда брать итоги прогонов ai-runner.
   # Необязательно: если spring-runner не запущен, страница покажет только данные шлюза. Пусто — не спрашивать.
