@@ -19,6 +19,9 @@ import org.springframework.http.HttpHeaders;
  *       {@code ratelimit-reset} (секунды до сброса), а также {@code x-ratelimit-remaining-minute}</li>
  *   <li>Все: {@code Retry-After} — секунды или HTTP-дата (RFC 1123)</li>
  * </ul>
+ * Сами лимиты (не остатки) — {@link #limits}: {@code x-ratelimit-limit-requests/-tokens} (Groq, OpenAI),
+ * {@code -requests-day}/{@code -tokens-day} (SambaNova), {@code x-ratelimit-limit-minute/-day} (Kong, OVH),
+ * {@code ratelimit-limit} + {@code ratelimit-policy: 2;w=60} (IETF draft).
  * HttpHeaders в Spring регистронезависимы, поэтому "X-RateLimit-Remaining" == "x-ratelimit-remaining".
  */
 public final class RateLimitHeaders {
@@ -37,6 +40,57 @@ public final class RateLimitHeaders {
             }
         }
         return null;
+    }
+
+    /**
+     * Лимиты, которые провайдер сообщил в заголовках. Поля, которых нет, — null.
+     *
+     * @param requestsPerDay true для Groq: у него x-ratelimit-limit-requests — это RPD, а не RPM
+     */
+    public static ru.akiev.gateway.limits.DiscoveredLimits limits(HttpHeaders h, boolean requestsPerDay) {
+        Long rpm = null;
+        Long rpd = null;
+        Long requests = parseLong(h.getFirst("x-ratelimit-limit-requests"));
+        if (requestsPerDay) {
+            rpd = requests;
+        } else {
+            rpm = requests;
+        }
+        rpm = first(rpm, parseLong(h.getFirst("x-ratelimit-limit-requests-minute")),
+                parseLong(h.getFirst("x-ratelimit-limit-minute")));
+        rpd = first(rpd, parseLong(h.getFirst("x-ratelimit-limit-requests-day")),
+                parseLong(h.getFirst("x-ratelimit-limit-day")));
+        // IETF draft: "ratelimit-limit: 2" + "ratelimit-policy: 2;w=60" — окно в секундах.
+        Long ietf = parseLong(h.getFirst("ratelimit-limit"));
+        String policy = h.getFirst("ratelimit-policy");
+        if (ietf != null && policy != null) {
+            Matcher w = Pattern.compile("w=(\\d+)").matcher(policy);
+            if (w.find()) {
+                long window = Long.parseLong(w.group(1));
+                if (window == 60) {
+                    rpm = first(rpm, ietf);
+                } else if (window == 86_400) {
+                    rpd = first(rpd, ietf);
+                }
+            }
+        }
+        Long tpm = parseLong(h.getFirst("x-ratelimit-limit-tokens"));
+        Long tpd = parseLong(h.getFirst("x-ratelimit-limit-tokens-day"));
+        return new ru.akiev.gateway.limits.DiscoveredLimits(positive(rpm), positive(rpd), positive(tpm),
+                positive(tpd), null);
+    }
+
+    private static Long first(Long... values) {
+        for (Long v : values) {
+            if (v != null) {
+                return v;
+            }
+        }
+        return null;
+    }
+
+    private static Long positive(Long v) {
+        return v == null || v <= 0 ? null : v;
     }
 
     public static Long remainingTokens(HttpHeaders h) {

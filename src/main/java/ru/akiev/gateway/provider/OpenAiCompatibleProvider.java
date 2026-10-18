@@ -40,6 +40,7 @@ public class OpenAiCompatibleProvider implements LlmProvider {
     private final Duration timeout;
     private final ProviderState state;
     private final Clock clock;
+    private final boolean requestsHeaderPerDay;
 
     public OpenAiCompatibleProvider(WebClient.Builder builder, ProviderProperties props) {
         this(builder, props, Clock.systemUTC());
@@ -50,6 +51,7 @@ public class OpenAiCompatibleProvider implements LlmProvider {
         this.clock = clock;
         this.timeout = props.timeout() != null ? props.timeout() : Duration.ofSeconds(120);
         this.state = new ProviderState(props.limits());
+        this.requestsHeaderPerDay = ru.akiev.gateway.limits.ProbeKind.of(props).requestsHeaderIsPerDay();
         // WebClient неизменяемый и потокобезопасный: создаём один раз и переиспользуем.
         // baseUrl — общий префикс (например https://api.groq.com/openai/v1),
         // заголовки по умолчанию добавляются к каждому запросу.
@@ -80,7 +82,7 @@ public class OpenAiCompatibleProvider implements LlmProvider {
 
     @Override
     public List<String> models() {
-        return props.model() != null ? List.of(props.model()) : List.of();
+        return props.allModels();
     }
 
     @Override
@@ -88,7 +90,8 @@ public class OpenAiCompatibleProvider implements LlmProvider {
         // Override модели: клиент может прислать любое имя (например "openai/coder" от Aider),
         // а провайдеру уходит реальная модель из конфигурации.
         ChatRequest outgoing = request.withoutStream();
-        if (props.model() != null && !props.model().isBlank()) {
+        if (props.model() != null && !props.model().isBlank() && (request.model() == null || !props.models().contains(request.model()))) {
+            // Модель из списка models уходит как есть, всё остальное заменяем на основную модель провайдера.
             outgoing = outgoing.withModel(props.model());
         }
         state.recordRequest(clock.instant());
@@ -169,7 +172,8 @@ public class OpenAiCompatibleProvider implements LlmProvider {
     @Override
     public Flux<String> chatStream(ChatRequest request) {
         ChatRequest outgoing = request.withStream(props.streamUsage());
-        if (props.model() != null && !props.model().isBlank()) {
+        if (props.model() != null && !props.model().isBlank() && (request.model() == null || !props.models().contains(request.model()))) {
+            // Модель из списка models уходит как есть, всё остальное заменяем на основную модель провайдера.
             outgoing = outgoing.withModel(props.model());
         }
         ChatRequest body = outgoing;
@@ -217,7 +221,15 @@ public class OpenAiCompatibleProvider implements LlmProvider {
      * Сохраняем остатки лимитов. Если запросов не осталось (remaining = 0) — сразу ставим
      * cooldown до сброса лимита, чтобы роутер не тратил на этого провайдера следующий запрос.
      */
-    private void updateLimits(HttpHeaders headers) {
+    /**
+     * Также (#34, п. 7): сами лимиты из x-ratelimit-limit-* обновляют действующие лимиты (источник headers),
+     * а остаток токенов x-ratelimit-remaining-tokens уточняет минутный бюджет TPM.
+     */
+    public void updateLimits(HttpHeaders headers) {
+        ru.akiev.gateway.limits.DiscoveredLimits discovered = RateLimitHeaders.limits(headers, requestsHeaderPerDay);
+        if (state.applyHeaderLimits(discovered)) {
+            log.info("Провайдер {}: лимиты из заголовков, действующие: {}", name(), state.effectiveLimits());
+        }
         Long reqs = RateLimitHeaders.remainingRequests(headers);
         Long toks = RateLimitHeaders.remainingTokens(headers);
         state.updateRemaining(reqs, toks);
@@ -226,6 +238,9 @@ public class OpenAiCompatibleProvider implements LlmProvider {
             Duration rr = RateLimitHeaders.resetRequests(headers, now);
             Duration rt = RateLimitHeaders.resetTokens(headers);
             state.updateResets(now, rr != null ? now.plus(rr) : null, rt != null ? now.plus(rt) : null);
+            if (toks != null) {
+                state.budget().observeRemaining(now, toks, rt != null ? now.plus(rt) : null);
+            }
             log.debug("Провайдер {}: remaining requests={}, tokens={}", name(), reqs, toks);
         }
         if (reqs != null && reqs <= 0) {
