@@ -41,12 +41,14 @@ public class StatusService {
     private final ProviderHealthService health;
     private final Clock clock;
     private final RoutingSettingsService routingSettings;
+    private final ru.akiev.gateway.limits.LimitDiscoveryService discovery;
     private final ZoneId zone = ZoneId.systemDefault();
 
     public StatusService(ProviderRouter router, GatewayProperties props, UsageRecordRepository repository,
             OpenRouterKeyPoller openRouter, ProviderHealthService health, Clock clock,
-            RoutingSettingsService routingSettings) {
+            RoutingSettingsService routingSettings, ru.akiev.gateway.limits.LimitDiscoveryService discovery) {
         this.routingSettings = routingSettings;
+        this.discovery = discovery;
         this.health = health;
         this.router = router;
         this.props = props;
@@ -96,7 +98,10 @@ public class StatusService {
                     mine.isEmpty() ? null : Math.round(mine.stream().mapToLong(UsageRecord::getLatencyMs).average().orElse(0)),
                     s.lastError(), s.lastErrorAt(), keyInfo(p.name()),
                     s.resetRequestsAt(), s.resetTokensAt(), s.limitsSeenAt(),
-                    health.lastPing(p.name()).orElse(null), keyless(p.name())));
+                    health.lastPing(p.name()).orElse(null), keyless(p.name()),
+                    limitsView(s, now), s.excluded(), s.excludedReason(), s.excludedSince(),
+                    discovery.lastProbe(p.name()).map(r -> new StatusSnapshot.ProbeView(r.ok(), r.method(),
+                            r.httpStatus(), r.error(), r.latencyMs(), r.checkedAt())).orElse(null)));
         }
         // Провайдеры без ключа тоже показываем — со статусом skipped.
         for (ProviderProperties pp : props.providers()) {
@@ -105,7 +110,8 @@ public class StatusService {
                         null, "api-key не задан", null, null, null,
                         pp.limits() != null ? pp.limits().rpm() : null, null,
                         pp.limits() != null ? pp.limits().rpd() : null,
-                        0, 0, 0, null, null, null, null, null, null, null, null, false));
+                        0, 0, 0, null, null, null, null, null, null, null, null, false,
+                        null, false, null, null, null));
             }
         }
         providers.sort((a, b) -> Integer.compare(a.priority(), b.priority()));
@@ -154,6 +160,25 @@ public class StatusService {
         }
         options.sort((a, b) -> Integer.compare(a.priority(), b.priority()));
         return options;
+    }
+
+    /** Лимиты провайдера для дашборда: значение + использовано + остаток + источник по каждому измерению. */
+    static StatusSnapshot.LimitsView limitsView(ProviderState s, Instant now) {
+        var e = s.effectiveLimits();
+        var b = s.budget();
+        return new StatusSnapshot.LimitsView(
+                usage(e.rpm(), s.limits().lastMinute(now), null),
+                usage(e.rpd(), s.limits().lastDay(now), null),
+                usage(e.tpm(), b.minuteTokens(now), b.minuteRemaining(now)),
+                usage(e.tokensPerDay(), b.dayTokens(now), null),
+                usage(e.tokensPerMonth(), b.monthTokens(now), null));
+    }
+
+    private static StatusSnapshot.LimitUsage usage(ru.akiev.gateway.limits.EffectiveLimits.LimitValue v, long used,
+            Long remaining) {
+        Long rem = remaining != null ? Long.valueOf(Math.max(0, remaining))
+                : v.value() == null ? null : Long.valueOf(Math.max(0, v.value() - used));
+        return new StatusSnapshot.LimitUsage(v.value(), used, rem, v.source());
     }
 
     private StatusSnapshot.KeyInfo keyInfo(String provider) {
