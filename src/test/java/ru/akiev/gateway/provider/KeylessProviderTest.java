@@ -101,7 +101,7 @@ class KeylessProviderTest {
                 props("groq", "k", false)), Duration.ofMinutes(5));
 
         ProviderRouter router = new ProviderConfig().providerRouter(WebClient.builder(), gp, Clock.systemUTC(),
-                mock(UsageService.class), null);
+                mock(UsageService.class), null, ru.akiev.gateway.config.LimitsProperties.LEGACY);
 
         assertThat(router.names()).containsExactlyInAnyOrder("kilo", "groq");
     }

@@ -5,16 +5,23 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.Iterator;
+import java.util.Set;
 import java.util.stream.Stream;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import ru.akiev.gateway.dto.ChatRequest;
+import ru.akiev.gateway.config.LimitsProperties;
 import ru.akiev.gateway.dto.ChatResponse;
+import ru.akiev.gateway.limits.RequestEstimator;
+import ru.akiev.gateway.limits.TokenBudget;
 import ru.akiev.gateway.provider.LlmProvider;
 import ru.akiev.gateway.provider.ProviderException;
+import ru.akiev.gateway.provider.ProviderState;
+import ru.akiev.gateway.usage.RequestTags;
 
 /**
  * Роутер: для каждого запроса перебирает провайдеров по приоритету и отдаёт ответ первого,
@@ -38,6 +45,19 @@ import ru.akiev.gateway.provider.ProviderException;
  *
  * <p>Это «последовательный» failover внутри одного HTTP-запроса клиента: клиент ничего не
  * знает о переключениях, он просто получает ответ (чуть позже).
+ *
+ * <p><b>Лимиты (issue #34).</b> Перед отправкой запрос оценивается ({@link RequestEstimator}: вход + max_tokens).
+ * Кандидаты — провайдеры, у которых есть запрошенная модель и хватает места по ВСЕМ лимитам
+ * (RPM, RPD, TPM, токены в сутки и в месяц, см. {@link ProviderState#capacity}). Под выбранного провайдера
+ * токены резервируются сразу ({@link TokenBudget#reserve}), после ответа резерв заменяется реальным usage.
+ * <ul>
+ *   <li>Запрос больше TPM всех провайдеров — сразу 413 request_too_large (ждать бесполезно).</li>
+ *   <li>Места нет ни у кого сейчас — ждём до gateway.limits.max-wait (поток Tomcat спит: у нас Spring MVC,
+ *       «один запрос = один поток»), потом 429 rate_limit_exceeded с Retry-After.</li>
+ *   <li>429 от провайдера — пауза ({@link ProviderState#pauseAfter429}) и failover; паузу досрочно снимает
+ *       первый успешный ping LimitDiscoveryService.</li>
+ *   <li>pin-model-per-run — запросы с одним x-run-id идут к одному провайдеру, пока он доступен.</li>
+ * </ul>
  */
 public class ProviderRouter {
 
@@ -51,6 +71,20 @@ public class ProviderRouter {
     private volatile RoutingSettings routing = RoutingSettings.DEFAULT;
     /** Счётчик round-robin: getAndIncrement атомарен, два параллельных запроса не получат один старт. */
     private final AtomicLong rrCounter = new AtomicLong();
+    private final LimitsProperties limits;
+    private final RequestEstimator estimator;
+    private final Sleeper sleeper;
+    private final RunPins pins;
+    /** Выбор + резерв токенов под одним замком: два параллельных запроса не займут один и тот же остаток. */
+    private final Object selectLock = new Object();
+
+    /** Как ждать освобождения лимита. В проде — Thread.sleep, в тестах — «перемотка» фейковых часов. */
+    @FunctionalInterface
+    public interface Sleeper {
+        void sleep(Duration d) throws InterruptedException;
+
+        Sleeper THREAD = d -> Thread.sleep(Math.max(1, d.toMillis()));
+    }
 
     public ProviderRouter(List<LlmProvider> providers, Duration defaultCooldown, Clock clock) {
         this(providers, defaultCooldown, clock, RouterListener.NOOP);
@@ -58,10 +92,23 @@ public class ProviderRouter {
 
     public ProviderRouter(List<LlmProvider> providers, Duration defaultCooldown, Clock clock,
             RouterListener listener) {
+        this(providers, defaultCooldown, clock, listener, LimitsProperties.LEGACY, Sleeper.THREAD);
+    }
+
+    public ProviderRouter(List<LlmProvider> providers, Duration defaultCooldown, Clock clock,
+            RouterListener listener, LimitsProperties limits, Sleeper sleeper) {
         this.listener = listener;
         this.providers = providers.stream().sorted(Comparator.comparingInt(LlmProvider::priority)).toList();
         this.defaultCooldown = defaultCooldown != null ? defaultCooldown : Duration.ofMinutes(5);
         this.clock = clock;
+        this.limits = limits != null ? limits : LimitsProperties.LEGACY;
+        this.estimator = new RequestEstimator(this.limits.defaultMaxTokens());
+        this.sleeper = sleeper != null ? sleeper : Sleeper.THREAD;
+        this.pins = new RunPins(this.limits.pinTtl());
+    }
+
+    public LimitsProperties limitsSettings() {
+        return limits;
     }
 
     public List<LlmProvider> providers() {
@@ -125,7 +172,8 @@ public class ProviderRouter {
             providers.stream().filter(p -> !available.contains(p)).forEach(result::add);
             return result;
         }
-        if (s.primary() == null) {
+        if (s.mode() == RoutingMode.HEADROOM || s.primary() == null) {
+            // HEADROOM: порядок по priority нужен только для «ничьей» — выбирает select() по запасу.
             return providers;
         }
         List<LlmProvider> result = new ArrayList<>(providers.size());
@@ -134,51 +182,256 @@ public class ProviderRouter {
         return result;
     }
 
-    public ChatResponse chat(ChatRequest request) {
-        List<String> failures = new ArrayList<>();
-        List<String> tooLarge = new ArrayList<>();
-        int attempted = 0;
-        for (LlmProvider p : order(true)) {
+    // ---------------------------------------------------------------------------------------------
+    // Выбор провайдера по лимитам
+    // ---------------------------------------------------------------------------------------------
+
+    /** Выбранный провайдер и резерв токенов под запрос. */
+    record Selection(LlmProvider provider, TokenBudget.Reservation reservation) {
+    }
+
+    /** Состояние перебора одного клиентского запроса. */
+    private final class Attempt {
+        final ChatRequest request;
+        final long tokens;
+        final List<LlmProvider> ordered = order(true);
+        final Set<LlmProvider> tried = new HashSet<>();
+        final List<String> failures = new ArrayList<>();
+        final List<String> tooLarge = new ArrayList<>();
+        final String runId = RequestTags.current().runId();
+        final Instant deadline;
+        int attempted;
+        /** Ближайший момент освобождения среди провайдеров, упёршихся в лимит (для Retry-After). */
+        Instant limitRetryAt;
+        boolean limitBlocked;
+
+        Attempt(ChatRequest request) {
+            this.request = request;
+            this.tokens = estimator.estimate(request).total();
+            this.deadline = clock.instant().plus(limits.maxWait());
+        }
+
+        /** Провайдеры, у которых есть запрошенная модель; если её нет ни у кого — все (как до #34). */
+        List<LlmProvider> modelCandidates() {
+            String model = request.model();
+            List<LlmProvider> withModel = model == null ? List.of()
+                    : ordered.stream().filter(p -> p.models().contains(model)).toList();
+            return withModel.isEmpty() ? ordered : withModel;
+        }
+    }
+
+    /**
+     * Запрос больше TPM у всех провайдеров, кроме исключённых (и у каждого TPM известен) — 413 сразу,
+     * не тратя ни одной попытки.
+     */
+    private void rejectIfLargerThanEveryTpm(Attempt a) {
+        Instant now = clock.instant();
+        List<LlmProvider> live = a.modelCandidates().stream().filter(p -> !p.state().excluded()).toList();
+        if (live.isEmpty()) {
+            return;
+        }
+        boolean all = live.stream().allMatch(p -> p.state().capacity(now, a.tokens).neverFits());
+        if (all) {
+            String tpms = String.join(", ", live.stream()
+                    .map(p -> p.name() + " tpm=" + p.state().budget().tpm()).toList());
+            log.warn("Запрос ~{} токенов больше TPM всех провайдеров ({}) — 413 без попыток", a.tokens, tpms);
+            throw new RequestTooLargeException("Request too large: ~" + a.tokens + " tokens (input + max_tokens) exceeds "
+                    + "the tokens-per-minute limit of every provider (" + tpms + "). Reduce the prompt or max_tokens.");
+        }
+    }
+
+    /**
+     * Следующий провайдер для попытки или null, если больше некого (тогда вызывающий бросит 429/503).
+     *
+     * <p>Если подходящие есть, но все упёрлись в минутные лимиты, которые освободятся до дедлайна, —
+     * спим до ближайшего освобождения и пробуем снова.
+     */
+    private Selection next(Attempt a) {
+        boolean pinFallbackLogged = false;
+        while (true) {
             Instant now = clock.instant();
-            if (!p.state().isAvailable(now)) {
-                log.debug("Пропускаем {}: недоступен (cooldown до {}, причина: {})",
-                        p.name(), p.state().cooldownUntil(), p.state().cooldownReason());
-                failures.add(p.name() + ": unavailable");
-                continue;
-            }
-            try {
-                log.info("Запрос → провайдер {} (priority {}, режим {})", p.name(), p.priority(), routing.mode());
-                long start = System.nanoTime();
-                try {
-                    ChatResponse resp = p.chat(request);
-                    listener.onSuccess(p, resp, (System.nanoTime() - start) / 1_000_000);
-                    return resp;
-                } catch (ProviderException e) {
-                    listener.onFailure(p, e, (System.nanoTime() - start) / 1_000_000);
-                    throw e;
+            Instant wakeAt = null;
+            synchronized (selectLock) {
+                List<LlmProvider> candidates = new ArrayList<>(a.modelCandidates());
+                candidates.removeAll(a.tried);
+                String pinned = limits.pinModelPerRun() ? pins.get(a.runId, now) : null;
+                LlmProvider pinnedProvider = pinned == null ? null
+                        : candidates.stream().filter(p -> p.name().equals(pinned)).findFirst().orElse(null);
+                LlmProvider best = null;
+                double bestHeadroom = Double.NEGATIVE_INFINITY;
+                boolean pinnedWaitable = false;
+                a.limitBlocked = false;
+                a.limitRetryAt = null;
+                for (LlmProvider p : candidates) {
+                    ProviderState.Capacity c = p.state().capacity(now, a.tokens);
+                    if (!c.fits()) {
+                        boolean limit = isLimit(c.blockedBy()) && !c.neverFits();
+                        if (limit) {
+                            a.limitBlocked = true;
+                            if (c.retryAt() != null && (a.limitRetryAt == null || c.retryAt().isBefore(a.limitRetryAt))) {
+                                a.limitRetryAt = c.retryAt();
+                            }
+                            if (c.retryAt() != null && !c.retryAt().isAfter(a.deadline)) {
+                                wakeAt = wakeAt == null || c.retryAt().isBefore(wakeAt) ? c.retryAt() : wakeAt;
+                                pinnedWaitable |= p == pinnedProvider;
+                            }
+                        }
+                        log.debug("Пропускаем {}: {} (до {})", p.name(), c.blockedBy(), c.retryAt());
+                        continue;
+                    }
+                    if (pinnedProvider != null && p != pinnedProvider) {
+                        continue; // run привязан к другому провайдеру — этот пока не рассматриваем
+                    }
+                    // HEADROOM — максимум запаса; остальные режимы — первый подходящий в порядке order().
+                    if (routing.mode() == RoutingMode.HEADROOM ? c.headroom() > bestHeadroom : best == null) {
+                        best = p;
+                        bestHeadroom = c.headroom();
+                    }
                 }
-            } catch (ProviderException e) {
-                if (e.isRequestTooLarge()) {
-                    tooLarge(p, e, tooLarge, failures);
+                if (best != null) {
+                    return reserve(a, best, now, pinned);
+                }
+                if (pinnedProvider != null && !pinnedWaitable) {
+                    // Привязанный провайдер недоступен надолго (cooldown/исключён/сутки) — снимаем привязку.
+                    if (!pinFallbackLogged) {
+                        log.warn("x-run-id {}: привязанный провайдер {} недоступен — переключаемся на другого",
+                                a.runId, pinned);
+                        pinFallbackLogged = true;
+                    }
+                    a.tried.add(pinnedProvider);
                     continue;
                 }
-                if (!e.isRetriable()) {
-                    // 400/404 и т.п. — не failover, но обязательно в лог (например, OpenRouter 404
-                    // «No endpoints found» для снятой :free модели).
-                    log.warn("Провайдер {} ответил {} (без failover): {}", p.name(), e.status(), snippet(e.getMessage()));
-                    throw e;
+            }
+            if (wakeAt == null) {
+                for (LlmProvider p : a.modelCandidates()) {
+                    if (!a.tried.contains(p)) {
+                        a.failures.add(p.name() + ": " + describe(p.state().capacity(now, a.tokens)));
+                    }
                 }
-                Duration cd = e.retryAfter() != null ? e.retryAfter() : defaultCooldown;
-                p.state().cooldown(clock.instant().plus(cd), "HTTP " + e.status());
-                attempted++;
-                log.warn("Failover: {} ответил {} — cooldown {}, пробуем следующего. {}",
-                        p.name(), e.status(), cd, snippet(e.getMessage()));
-                failures.add(p.name() + ": HTTP " + e.status());
+                return null;
+            }
+            Duration sleep = Duration.between(now, wakeAt);
+            sleep = sleep.isNegative() || sleep.isZero() ? Duration.ofMillis(50) : sleep;
+            log.info("Места под запрос (~{} токенов) нет ни у кого — ждём {} мс (макс. до {})",
+                    a.tokens, sleep.toMillis(), a.deadline);
+            try {
+                sleeper.sleep(sleep);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return null;
             }
         }
-        throwIfAllTooLarge(tooLarge, attempted);
-        throw new AllProvidersUnavailableException(
-                "All providers are unavailable" + (failures.isEmpty() ? "" : " (" + String.join(", ", failures) + ")"));
+    }
+
+    private Selection reserve(Attempt a, LlmProvider p, Instant now, String pinned) {
+        TokenBudget.Reservation r = p.state().budget().reserve(now, a.tokens);
+        if (limits.pinModelPerRun() && a.runId != null) {
+            String prev = pins.put(a.runId, p.name(), now);
+            if (prev != null && !prev.equals(p.name())) {
+                log.warn("x-run-id {}: провайдер сменился {} → {}", a.runId, prev, p.name());
+            } else if (pinned == null) {
+                log.info("x-run-id {} привязан к провайдеру {}", a.runId, p.name());
+            }
+        }
+        a.tried.add(p);
+        return new Selection(p, r);
+    }
+
+    private static boolean isLimit(String blockedBy) {
+        return blockedBy != null && !"excluded".equals(blockedBy) && !"cooldown".equals(blockedBy);
+    }
+
+    private static String describe(ProviderState.Capacity c) {
+        if (c.neverFits()) {
+            return "request larger than tpm";
+        }
+        if (c.blockedBy() == null) {
+            return "unavailable";
+        }
+        return switch (c.blockedBy()) {
+            case "excluded" -> "excluded (no ping response)";
+            case "cooldown" -> "unavailable";
+            default -> "limit " + c.blockedBy();
+        };
+    }
+
+    /** Никого не осталось: 413 (всем велик), 429 (упёрлись в лимиты) или 503 (все упали / в паузе). */
+    private RuntimeException exhausted(Attempt a) {
+        throwIfAllTooLarge(a.tooLarge, a.attempted);
+        String reasons = a.failures.isEmpty() ? "" : " (" + String.join(", ", a.failures) + ")";
+        if (a.limitBlocked) {
+            Instant now = clock.instant();
+            Duration retry = a.limitRetryAt != null && a.limitRetryAt.isAfter(now)
+                    ? Duration.between(now, a.limitRetryAt) : Duration.ofMinutes(1);
+            log.warn("Лимиты всех провайдеров исчерпаны{} — 429, повторить через {}", reasons, retry);
+            return new RateLimitedException("Rate limit exceeded on all providers" + reasons, retry);
+        }
+        return new AllProvidersUnavailableException("All providers are unavailable" + reasons);
+    }
+
+    /** Ответ без usage — резерв остаётся оценкой; ошибка до генерации (4xx/5xx кроме таймаута) — токены не потрачены. */
+    private static void settleFailure(Selection s, ProviderException e) {
+        if (e.status() != 504 && e.status() != 499) {
+            s.provider().state().budget().settle(s.reservation(), 0L);
+        }
+    }
+
+    private static Long usageTokens(ChatResponse resp) {
+        return resp != null && resp.usage() != null && resp.usage().totalTokens() != null
+                ? resp.usage().totalTokens().longValue() : null;
+    }
+
+    /**
+     * Общая обработка ошибки попытки: 413 — без паузы; 4xx — наружу без failover; 429 — пауза до первого
+     * успешного ping; прочие (5xx, таймаут) — cooldown. Возвращает нормально, если надо пробовать следующего.
+     */
+    private void onAttemptFailure(Attempt a, LlmProvider p, ProviderException e, String what) {
+        if (e.isRequestTooLarge()) {
+            tooLarge(p, e, a.tooLarge, a.failures);
+            return;
+        }
+        if (!e.isRetriable()) {
+            // 400/404 и т.п. — не failover, но обязательно в лог (например, OpenRouter 404
+            // «No endpoints found» для снятой :free модели).
+            log.warn("Провайдер {} ответил {} (без failover): {}", p.name(), e.status(), snippet(e.getMessage()));
+            throw e;
+        }
+        Duration cd = e.retryAfter() != null ? e.retryAfter() : defaultCooldown;
+        Instant now = clock.instant();
+        if (e.status() == 429) {
+            p.state().pauseAfter429(now, now.plus(cd), "HTTP 429");
+            log.warn("{}: {} ответил 429 — пауза до {} или до первого успешного ping, пробуем следующего. {}",
+                    what, p.name(), now.plus(cd), snippet(e.getMessage()));
+        } else {
+            p.state().cooldown(now.plus(cd), "HTTP " + e.status());
+            log.warn("{}: {} ответил {} — cooldown {}, пробуем следующего. {}",
+                    what, p.name(), e.status(), cd, snippet(e.getMessage()));
+        }
+        a.attempted++;
+        a.failures.add(p.name() + ": HTTP " + e.status());
+    }
+
+    public ChatResponse chat(ChatRequest request) {
+        Attempt a = new Attempt(request);
+        rejectIfLargerThanEveryTpm(a);
+        Selection s;
+        while ((s = next(a)) != null) {
+            LlmProvider p = s.provider();
+            log.info("Запрос → провайдер {} (priority {}, режим {}, оценка ~{} токенов)",
+                    p.name(), p.priority(), routing.mode(), a.tokens);
+            long start = System.nanoTime();
+            try {
+                ChatResponse resp = p.chat(request);
+                p.state().budget().settle(s.reservation(), usageTokens(resp));
+                listener.onSuccess(p, resp, (System.nanoTime() - start) / 1_000_000);
+                return resp;
+            } catch (ProviderException e) {
+                settleFailure(s, e);
+                listener.onFailure(p, e, (System.nanoTime() - start) / 1_000_000);
+                onAttemptFailure(a, p, e, "Failover");
+            }
+        }
+        throw exhausted(a);
     }
 
     /**
@@ -198,17 +451,18 @@ public class ProviderRouter {
      * Java Stream (аналог block() для потоков). {@code iterator.hasNext()} блокирует поток, пока не
      * придёт первый элемент или ошибка. prefetch = сколько чанков Reactor запросит заранее —
      * это и есть ограничение буфера (backpressure).
+     *
+     * <p>Лимиты — как в {@link #chat}: резерв токенов при выборе, факт из usage-чанка — когда стрим закончится
+     * (обёртка над listener ниже).
      */
     public StreamSession openStream(ChatRequest request) {
-        List<String> failures = new ArrayList<>();
-        List<String> tooLarge = new ArrayList<>();
-        int attempted = 0;
-        for (LlmProvider p : order(true)) {
-            if (!p.state().isAvailable(clock.instant())) {
-                failures.add(p.name() + ": unavailable");
-                continue;
-            }
-            log.info("Стрим → провайдер {} (priority {}, режим {})", p.name(), p.priority(), routing.mode());
+        Attempt a = new Attempt(request);
+        rejectIfLargerThanEveryTpm(a);
+        Selection s;
+        while ((s = next(a)) != null) {
+            LlmProvider p = s.provider();
+            log.info("Стрим → провайдер {} (priority {}, режим {}, оценка ~{} токенов)",
+                    p.name(), p.priority(), routing.mode(), a.tokens);
             long start = System.nanoTime();
             Stream<String> stream = p.chatStream(request).toStream(STREAM_PREFETCH);
             Iterator<String> it = stream.iterator();
@@ -218,31 +472,32 @@ public class ProviderRouter {
                     throw new ProviderException(502, "Provider " + p.name() + " returned empty stream", null);
                 }
                 String first = it.next();
-                return new StreamSession(p, stream, it, first, start, request.clientWantsStreamUsage(), listener);
+                return new StreamSession(p, stream, it, first, start, request.clientWantsStreamUsage(),
+                        settling(s));
             } catch (ProviderException e) {
                 stream.close();
+                settleFailure(s, e);
                 listener.onFailure(p, e, (System.nanoTime() - start) / 1_000_000);
-                if (e.isRequestTooLarge()) {
-                    tooLarge(p, e, tooLarge, failures);
-                    continue;
-                }
-                if (!e.isRetriable()) {
-                    // 400/404 и т.п. — не failover, но обязательно в лог (например, OpenRouter 404
-                    // «No endpoints found» для снятой :free модели).
-                    log.warn("Провайдер {} ответил {} (без failover): {}", p.name(), e.status(), snippet(e.getMessage()));
-                    throw e;
-                }
-                Duration cd = e.retryAfter() != null ? e.retryAfter() : defaultCooldown;
-                p.state().cooldown(clock.instant().plus(cd), "HTTP " + e.status());
-                attempted++;
-                log.warn("Failover (стрим, до первого чанка): {} ответил {} — cooldown {}. {}", p.name(), e.status(), cd,
-                        snippet(e.getMessage()));
-                failures.add(p.name() + ": HTTP " + e.status());
+                onAttemptFailure(a, p, e, "Failover (стрим, до первого чанка)");
             }
         }
-        throwIfAllTooLarge(tooLarge, attempted);
-        throw new AllProvidersUnavailableException(
-                "All providers are unavailable" + (failures.isEmpty() ? "" : " (" + String.join(", ", failures) + ")"));
+        throw exhausted(a);
+    }
+
+    /** Listener стрима, который по окончании заменяет резерв токенов фактическим usage. */
+    private RouterListener settling(Selection s) {
+        return new RouterListener() {
+            @Override
+            public void onSuccess(LlmProvider provider, ChatResponse response, long latencyMs) {
+                provider.state().budget().settle(s.reservation(), usageTokens(response));
+                listener.onSuccess(provider, response, latencyMs);
+            }
+
+            @Override
+            public void onFailure(LlmProvider provider, ProviderException error, long latencyMs) {
+                listener.onFailure(provider, error, latencyMs);
+            }
+        };
     }
 
     private static final int STREAM_PREFETCH = 32;
