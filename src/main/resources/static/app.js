@@ -9,7 +9,7 @@
 // через retry-интервал (сервер присылает retry: 3000), и мы снова получаем snapshot.
 // Поэтому никакого setInterval/polling тут нет.
 
-const STATE_RU = { healthy: 'работает', cooldown: 'cooldown', limit: 'лимит', skipped: 'пропущен' };
+const STATE_RU = { healthy: 'работает', cooldown: 'cooldown', limit: 'лимит', skipped: 'пропущен', excluded: 'исключён' };
 const COLORS = ['#22c55e', '#3b82f6', '#a855f7', '#f59e0b', '#ef4444', '#14b8a6'];
 const fmt = n => (n ?? 0).toLocaleString('ru-RU');
 const time = iso => iso ? new Date(iso).toLocaleTimeString('ru-RU') : '—';
@@ -75,6 +75,33 @@ function keyRows(k) {
     <span>Проверено</span><span>${time(k.fetched_at)}</span>`;
 }
 
+// Лимиты (issue #34): по каждому — использовано / лимит, остаток и источник значения.
+// api — сообщил API провайдера (OpenRouter /key, Gonka /test-auth), headers — заголовки x-ratelimit-* ответа,
+// config — application.yml (провайдер ничего не сообщил).
+const SOURCE_RU = { api: 'API', headers: 'заголовки', config: 'конфиг' };
+const LIMIT_RU = [['rpm', 'Запросов в минуту'], ['rpd', 'Запросов в сутки'], ['tpm', 'Токенов в минуту'],
+  ['tokens_per_day', 'Токенов в сутки (UTC)'], ['tokens_per_month', 'Токенов в месяц (UTC)']];
+
+function limitsBlock(p) {
+  const l = p.limits;
+  if (!l) return '';
+  const rows = LIMIT_RU.map(([k, label]) => {
+    const u = l[k];
+    if (!u) return '';
+    const src = u.source ? ` <span class="muted" title="источник значения лимита">· ${SOURCE_RU[u.source] ?? u.source}</span>` : '';
+    if (u.limit == null) {
+      return u.remaining != null
+        ? `<span>${label}</span><span>${fmt(u.used)} · остаток ${fmt(u.remaining)}${src}</span>`
+        : `<span>${label}</span><span>${fmt(u.used)} / ∞</span>`;
+    }
+    return limitRow(label, u.used, u.limit).replace(`${fmt(u.used)} / ${fmt(u.limit)}</span>`,
+      `${fmt(u.used)} / ${fmt(u.limit)} · остаток ${fmt(u.remaining)}${src}</span>`);
+  }).join('');
+  const probe = p.limits_probe;
+  const probeRow = probe ? `<span>Опрос лимитов (${time(probe.checked_at)})</span><span class="${probe.ok ? 's-ok' : 's-bad'}" title="${esc(probe.method)}">${probe.ok ? 'ответил' : 'не ответил'}${probe.http_status ? ' · HTTP ' + probe.http_status : ''} · ${fmt(probe.latency_ms)} мс${probe.error ? ' · ' + esc(probe.error) : ''}</span>` : '';
+  return `<b class="sub">Лимиты (осталось)</b>${probeRow}${rows}`;
+}
+
 function renderProviders(list) {
   document.getElementById('providers').innerHTML = list.map(p => {
     return `<div class="card ${p.state}">
@@ -85,6 +112,7 @@ function renderProviders(list) {
       <div class="kv">
         ${p.state === 'skipped' ? `<span>Причина</span><span>${esc(p.cooldown_reason)}</span>` : `
         ${pingRow(p)}
+        ${limitsBlock(p)}
         <b class="sub">Квота</b>
         ${limitRow('RPM шлюза (минута)', p.rpm_used, p.rpm_limit)}
         ${limitRow('RPD шлюза (сутки)', p.rpd_used, p.rpd_limit)}
@@ -101,6 +129,7 @@ function renderProviders(list) {
         <span>Средняя задержка</span><span>${p.avg_latency_ms != null ? fmt(p.avg_latency_ms) + ' мс' : '—'}</span>`}
       </div>
       ${p.state === 'cooldown' ? `<div class="note">Пауза до ${time(p.cooldown_until)} (${esc(p.cooldown_reason)})</div>` : ''}
+      ${p.excluded ? `<div class="note">Исключён из роутинга с ${time(p.excluded_since)}: ${esc(p.excluded_reason)}. Перепроверка раз в минуту.</div>` : ''}
       ${p.last_error ? `<div class="note">Последняя ошибка: ${esc(p.last_error)} в ${time(p.last_error_at)}</div>` : ''}
     </div>`;
   }).join('');
@@ -108,7 +137,7 @@ function renderProviders(list) {
 
 // Режим роутинга: состояние приходит в snapshot (SSE) и в ответе GET/PUT/DELETE /status/routing.
 // Выбор сохраняется в БД и переживает рестарт; «Сбросить» (DELETE) возвращает gateway.routing из конфига.
-const MODE_RU = { PRIORITY: 'по приоритету', ROUND_ROBIN: 'round-robin' };
+const MODE_RU = { PRIORITY: 'по приоритету', ROUND_ROBIN: 'round-robin', HEADROOM: 'по запасу лимитов' };
 let routingBusy = false;
 
 // «HH:MM», а если не сегодня — «дд.мм HH:MM».
@@ -125,6 +154,7 @@ function optState(o) {
   if (!o) return '';
   switch (o.state) {
     case 'no_key': return 'нет ключа';
+    case 'excluded': return 'исключён (не отвечает)';
     case 'limit': return `лимит исчерпан до ${hhmm(o.until)}`;
     case 'cooldown':
       return /remaining|429/.test(o.reason ?? '') ? `лимит исчерпан до ${hhmm(o.until)}`

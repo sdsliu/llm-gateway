@@ -33,7 +33,7 @@ public class ProviderConfig {
      */
     @Bean
     public ProviderRouter providerRouter(WebClient.Builder builder, GatewayProperties props, Clock clock,
-            UsageService usageService, RoutingProperties routing) {
+            UsageService usageService, RoutingProperties routing, LimitsProperties limits) {
         List<LlmProvider> providers = props.providers().stream()
                 .filter(p -> {
                     if (!p.enabled()) {
@@ -48,7 +48,8 @@ public class ProviderConfig {
         if (providers.isEmpty()) {
             log.warn("Нет ни одного включённого провайдера — все запросы будут получать 503");
         }
-        ProviderRouter router = new ProviderRouter(providers, props.defaultCooldown(), clock, usageService);
+        ProviderRouter router = new ProviderRouter(providers, props.defaultCooldown(), clock, usageService,
+                limits, ProviderRouter.Sleeper.THREAD);
         router.setRouting(initialRouting(props, routing, router));
         log.info("Режим роутинга при старте: {}", router.routing());
         return router;

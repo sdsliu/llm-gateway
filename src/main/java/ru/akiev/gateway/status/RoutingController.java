@@ -45,7 +45,7 @@ public class RoutingController {
     public ResponseEntity<?> put(@RequestBody RoutingUpdate body) {
         RoutingMode mode = RoutingMode.parse(body.mode());
         if (mode == null) {
-            return bad("mode must be one of PRIORITY, ROUND_ROBIN (got: " + body.mode() + ")");
+            return bad("mode must be one of PRIORITY, ROUND_ROBIN, HEADROOM (got: " + body.mode() + ")");
         }
         try {
             settings.update(new RoutingSettings(mode, body.primary()));

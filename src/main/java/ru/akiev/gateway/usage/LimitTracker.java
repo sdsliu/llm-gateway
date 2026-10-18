@@ -11,17 +11,32 @@ import java.util.Deque;
  * <p>Храним время каждого запроса за последние 24 часа в очереди (старые — в начале).
  * «Скользящее окно» честнее, чем сброс счётчика в 00:00: лимит «30 в минуту» означает
  * «не больше 30 за любые 60 секунд». Памяти это почти не стоит (максимум rpd меток).
- * Лимиты передаются при создании из gateway.providers[].limits.
+ * Лимиты сначала берутся из gateway.providers[].limits, но могут быть заменены тем, что сообщил сам
+ * провайдер ({@link #setLimits}, см. {@code EffectiveLimits}).
  */
 public class LimitTracker {
 
-    private final Integer rpm;
-    private final Integer rpd;
+    // volatile: лимиты меняет поток опроса провайдеров, читают потоки запросов.
+    private volatile Integer rpm;
+    private volatile Integer rpd;
     private final Deque<Instant> sent = new ArrayDeque<>();
 
     public LimitTracker(Integer rpm, Integer rpd) {
         this.rpm = rpm;
         this.rpd = rpd;
+    }
+
+    /** Новые лимиты (обнаруженные у провайдера). null или 0 — без ограничения. */
+    public void setLimits(Integer rpm, Integer rpd) {
+        this.rpm = rpm;
+        this.rpd = rpd;
+    }
+
+    /** Восстановить метки запросов после рестарта (из usage_record за последние сутки). */
+    public synchronized void restore(java.util.List<Instant> times, Instant now) {
+        sent.clear();
+        times.stream().sorted().forEach(sent::addLast);
+        prune(now);
     }
 
     public synchronized void increment(Instant now) {

@@ -49,7 +49,37 @@ public record StatusSnapshot(
             // Результат последнего ping (GET /models), null — ещё не пинговали.
             @JsonProperty("last_ping") ProviderHealthService.PingResult lastPing,
             // true — провайдер работает без ключа (api-key-optional и api-key не задан): анонимные лимиты.
-            boolean keyless) {
+            boolean keyless,
+            // Лимиты (issue #34): по каждому — значение, сколько использовано, остаток и источник (api/headers/config).
+            LimitsView limits,
+            // Исключён из роутинга: не ответил на опрос при старте / перепинге (или ответил 429).
+            boolean excluded,
+            @JsonProperty("excluded_reason") String excludedReason,
+            @JsonProperty("excluded_since") Instant excludedSince,
+            // Последний опрос лимитов (LimitDiscoveryService), null — не опрашивали (startup-probe=false).
+            @JsonProperty("limits_probe") ProbeView limitsProbe) {
+    }
+
+    /**
+     * Один лимит.
+     *
+     * @param limit     значение лимита, null — не ограничен (провайдер не сообщил и в конфиге нет)
+     * @param used      использовано в текущем окне (минута — скользящая, сутки/месяц — по UTC)
+     * @param remaining остаток (для TPM — с учётом x-ratelimit-remaining-tokens), null — без ограничения
+     * @param source    api | headers | config, null — лимита нет
+     */
+    public record LimitUsage(Long limit, long used, Long remaining, ru.akiev.gateway.limits.LimitSource source) {
+    }
+
+    /** Все лимиты провайдера. */
+    public record LimitsView(LimitUsage rpm, LimitUsage rpd, LimitUsage tpm,
+            @JsonProperty("tokens_per_day") LimitUsage tokensPerDay,
+            @JsonProperty("tokens_per_month") LimitUsage tokensPerMonth) {
+    }
+
+    /** Итог последнего опроса лимитов. */
+    public record ProbeView(boolean ok, String method, @JsonProperty("http_status") Integer httpStatus, String error,
+            @JsonProperty("latency_ms") long latencyMs, @JsonProperty("checked_at") Instant checkedAt) {
     }
 
     /** Данные OpenRouter GET /api/v1/key. */

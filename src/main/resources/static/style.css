@@ -38,3 +38,5 @@ footer { margin-top:24px; color:var(--muted); font-size:12px; } a { color:#93c5f
 .rt-state .ok { color:var(--ok); } .rt-off { color:var(--muted, #94a3b8); } .rt-off small { color:var(--warn, #f59e0b); }
 .rt-note { flex:1 1 100%; margin-top:6px; color:var(--warn, #f59e0b); } .rt-warn { flex:1 1 100%; color:var(--bad); }
 .routing option:disabled { color:#64748b; } .rt-state #rt-current { display:block; }
+.card.excluded { border-color:var(--bad); opacity:.75; }
+.badge.excluded { background:#7f1d1d; color:#fecaca; }

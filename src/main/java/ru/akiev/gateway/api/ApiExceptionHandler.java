@@ -8,6 +8,7 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 import ru.akiev.gateway.dto.ErrorResponse;
 import ru.akiev.gateway.provider.ProviderException;
 import ru.akiev.gateway.router.AllProvidersUnavailableException;
+import ru.akiev.gateway.router.RateLimitedException;
 import ru.akiev.gateway.router.RequestTooLargeException;
 
 /** Ошибки в формате OpenAI. */
@@ -44,5 +45,14 @@ public class ApiExceptionHandler {
     public ResponseEntity<ErrorResponse> tooLarge(RequestTooLargeException e) {
         return ResponseEntity.status(413)
                 .body(ErrorResponse.of(e.getMessage(), "request_too_large", "request_too_large"));
+    }
+
+    /** Места нет ни у кого и за max-wait не освободилось: 429 + Retry-After (секунды, округление вверх). */
+    @ExceptionHandler(RateLimitedException.class)
+    public ResponseEntity<ErrorResponse> rateLimited(RateLimitedException e) {
+        long seconds = Math.max(1, (e.retryAfter().toMillis() + 999) / 1000);
+        return ResponseEntity.status(429)
+                .header(org.springframework.http.HttpHeaders.RETRY_AFTER, String.valueOf(seconds))
+                .body(ErrorResponse.of(e.getMessage(), "rate_limit_exceeded", "rate_limit_exceeded"));
     }
 }
