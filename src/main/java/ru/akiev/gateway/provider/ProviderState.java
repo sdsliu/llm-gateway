@@ -116,6 +116,14 @@ public class ProviderState {
         return limits.allows(now) ? null : "limit";
     }
 
+    /** До какого момента провайдер недоступен (конец cooldown или окна лимита), null — доступен сейчас. */
+    public synchronized Instant blockedUntil(Instant now) {
+        if (now.isBefore(cooldownUntil)) {
+            return cooldownUntil;
+        }
+        return limits.availableAt(now);
+    }
+
     public synchronized void recordError(Instant now, String error) {
         lastError = error;
         lastErrorAt = now;

@@ -73,8 +73,10 @@ public class ProviderRouter {
     }
 
     /**
-     * Сменить режим роутинга (только в памяти). primary должен быть одним из включённых провайдеров
-     * (с api-key), иначе {@link IllegalArgumentException}.
+     * Сменить режим роутинга в памяти (сохранение в БД — RoutingSettingsService). primary должен быть
+     * одним из включённых провайдеров (с api-key или keyless), иначе {@link IllegalArgumentException}.
+     * Cooldown / исчерпанный лимит primary выбор не запрещают: пока он недоступен, основной цикл его
+     * пропускает и идёт к следующему по priority, а когда пауза закончится — снова начинает с него.
      */
     public synchronized RoutingSettings setRouting(RoutingSettings next) {
         if (next.primary() != null && providers.stream().noneMatch(p -> p.name().equals(next.primary()))) {

@@ -40,10 +40,13 @@ public class StatusService {
     private final OpenRouterKeyPoller openRouter;
     private final ProviderHealthService health;
     private final Clock clock;
+    private final RoutingSettingsService routingSettings;
     private final ZoneId zone = ZoneId.systemDefault();
 
     public StatusService(ProviderRouter router, GatewayProperties props, UsageRecordRepository repository,
-            OpenRouterKeyPoller openRouter, ProviderHealthService health, Clock clock) {
+            OpenRouterKeyPoller openRouter, ProviderHealthService health, Clock clock,
+            RoutingSettingsService routingSettings) {
+        this.routingSettings = routingSettings;
         this.health = health;
         this.router = router;
         this.props = props;
@@ -118,8 +121,39 @@ public class StatusService {
 
     public RoutingInfo routing() {
         var s = router.routing();
+        var cfg = routingSettings.configDefault();
         return new RoutingInfo(s.mode(), s.primary(), router.names(),
-                router.previewOrder().stream().map(LlmProvider::name).toList());
+                router.previewOrder().stream().map(LlmProvider::name).toList(),
+                routingOptions(), routingSettings.source(), routingSettings.warning(),
+                new RoutingInfo.ConfigDefault(cfg.mode(), cfg.primary()));
+    }
+
+    /**
+     * Все настроенные провайдеры (по priority) с живым состоянием — для выпадающего списка primary.
+     * Cooldown и исчерпанный лимит выбор не запрещают (primary сохраняется, роутер вернётся к нему сам);
+     * нельзя выбрать только провайдера без api-key (он не создан как бин и запрос к нему не уйдёт).
+     */
+    private List<RoutingInfo.ProviderOption> routingOptions() {
+        Instant now = clock.instant();
+        List<RoutingInfo.ProviderOption> options = new ArrayList<>();
+        Set<String> enabled = router.providers().stream().map(LlmProvider::name).collect(Collectors.toSet());
+        for (LlmProvider p : router.providers()) {
+            ProviderState st = p.state();
+            String blocked = st.blockedBy(now);
+            options.add(new RoutingInfo.ProviderOption(p.name(), p.priority(), true,
+                    blocked == null ? "healthy" : blocked,
+                    blocked == null ? null : st.blockedUntil(now),
+                    "cooldown".equals(blocked) ? st.cooldownReason() : null,
+                    keyless(p.name())));
+        }
+        for (ProviderProperties pp : props.providers()) {
+            if (!enabled.contains(pp.name())) {
+                options.add(new RoutingInfo.ProviderOption(pp.name(), pp.priority(), false, "no_key", null,
+                        "api-key не задан", false));
+            }
+        }
+        options.sort((a, b) -> Integer.compare(a.priority(), b.priority()));
+        return options;
     }
 
     private StatusSnapshot.KeyInfo keyInfo(String provider) {

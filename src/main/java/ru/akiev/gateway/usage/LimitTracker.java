@@ -48,6 +48,27 @@ public class LimitTracker {
         return rpm == null || rpm <= 0 || lastMinute(now) < rpm;
     }
 
+    /**
+     * Когда снова можно будет отправить запрос (выйдет из окна самый старый «лишний» запрос),
+     * null — если можно уже сейчас. Для дашборда: «лимит исчерпан до HH:MM».
+     */
+    public synchronized Instant availableAt(Instant now) {
+        prune(now);
+        Instant at = null;
+        if (rpd != null && rpd > 0 && sent.size() >= rpd) {
+            at = sent.stream().skip(sent.size() - rpd).findFirst().orElseThrow().plus(Duration.ofDays(1));
+        }
+        if (rpm != null && rpm > 0) {
+            Instant from = now.minus(Duration.ofMinutes(1));
+            var minute = sent.stream().filter(t -> t.isAfter(from)).toList();
+            if (minute.size() >= rpm) {
+                Instant t = minute.get(minute.size() - rpm).plus(Duration.ofMinutes(1));
+                at = at == null || t.isAfter(at) ? t : at;
+            }
+        }
+        return at;
+    }
+
     public Integer rpm() {
         return rpm;
     }

@@ -1,5 +1,7 @@
 package ru.akiev.gateway.status;
 
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -18,7 +20,7 @@ import ru.akiev.gateway.router.ProviderRouter;
 import ru.akiev.gateway.router.RoutingMode;
 import ru.akiev.gateway.router.RoutingSettings;
 
-/** GET/PUT /status/routing: валидация, сохранение в роутере, поле routing в /status. */
+/** GET/PUT/DELETE /status/routing: валидация, сохранение в роутере и в БД, поле routing в /status. */
 @SpringBootTest(properties = {
         "gateway.routing.mode=priority",
         "gateway.routing.primary=",
@@ -35,10 +37,16 @@ class RoutingApiTest {
     MockMvc mvc;
     @Autowired
     ProviderRouter router;
+    @Autowired
+    RoutingSettingsService settings;
+    @Autowired
+    RoutingSettingsRepository repository;
 
     @AfterEach
     void reset() {
-        router.setRouting(RoutingSettings.DEFAULT);
+        // H2 общая для всех тестовых контекстов — не оставляем сохранённый режим другим тестам.
+        settings.reset();
+        router.providers().forEach(p -> p.state().resetCooldown());
     }
 
     ResultActions putRouting(String json) throws Exception {
@@ -90,5 +98,63 @@ class RoutingApiTest {
         putRouting("{\"mode\":\"PRIORITY\",\"primary\":\"beta\"}").andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.error.message", Matchers.containsString("alpha, gamma")));
         org.assertj.core.api.Assertions.assertThat(router.routing()).isEqualTo(RoutingSettings.DEFAULT);
+    }
+
+    @Test
+    void putIsSavedToDbAndDeleteResetsToConfig() throws Exception {
+        putRouting("{\"mode\":\"PRIORITY\",\"primary\":\"gamma\"}").andExpect(status().isOk())
+                .andExpect(jsonPath("$.source").value("DB"));
+        var saved = repository.findById(RoutingSettingsRecord.SINGLETON_ID).orElseThrow();
+        assertThat(saved.getMode()).isEqualTo("PRIORITY");
+        assertThat(saved.getPrimaryProvider()).isEqualTo("gamma");
+        assertThat(saved.getUpdatedAt()).isNotNull();
+
+        // повторный PUT обновляет ту же единственную строку
+        putRouting("{\"mode\":\"round-robin\"}").andExpect(status().isOk());
+        assertThat(repository.findAll()).singleElement()
+                .satisfies(r -> assertThat(r.getMode()).isEqualTo("ROUND_ROBIN"))
+                .satisfies(r -> assertThat(r.getPrimaryProvider()).isNull());
+
+        mvc.perform(delete("/status/routing")).andExpect(status().isOk())
+                .andExpect(jsonPath("$.mode").value("PRIORITY"))
+                .andExpect(jsonPath("$.primary").value(Matchers.nullValue()))
+                .andExpect(jsonPath("$.source").value("CONFIG"))
+                .andExpect(jsonPath("$.config.mode").value("PRIORITY"));
+        assertThat(repository.count()).isZero();
+        assertThat(router.routing()).isEqualTo(RoutingSettings.DEFAULT);
+        mvc.perform(get("/status")).andExpect(jsonPath("$.routing.source").value("CONFIG"));
+    }
+
+    @Test
+    void invalidPutDoesNotTouchDb() throws Exception {
+        putRouting("{\"mode\":\"PRIORITY\",\"primary\":\"beta\"}").andExpect(status().isBadRequest());
+        assertThat(repository.count()).isZero();
+    }
+
+    @Test
+    void optionsListAllProvidersAndNoKeyIsDisabled() throws Exception {
+        mvc.perform(get("/status/routing")).andExpect(status().isOk())
+                .andExpect(jsonPath("$.options[*].name", Matchers.contains("alpha", "beta", "gamma")))
+                .andExpect(jsonPath("$.options[0].selectable").value(true))
+                .andExpect(jsonPath("$.options[0].state").value("healthy"))
+                .andExpect(jsonPath("$.options[1].selectable").value(false))
+                .andExpect(jsonPath("$.options[1].state").value("no_key"))
+                .andExpect(jsonPath("$.options[2].selectable").value(true));
+    }
+
+    @Test
+    void primaryInCooldownStaysSelectableAndShowsUntil() throws Exception {
+        var gamma = router.providers().stream().filter(p -> p.name().equals("gamma")).findFirst().orElseThrow();
+        gamma.state().cooldown(java.time.Instant.now().plusSeconds(600), "HTTP 429");
+        mvc.perform(get("/status/routing"))
+                .andExpect(jsonPath("$.options[2].state").value("cooldown"))
+                .andExpect(jsonPath("$.options[2].selectable").value(true))
+                .andExpect(jsonPath("$.options[2].until").isNotEmpty())
+                .andExpect(jsonPath("$.options[2].reason").value("HTTP 429"));
+        putRouting("{\"mode\":\"PRIORITY\",\"primary\":\"gamma\"}").andExpect(status().isOk())
+                .andExpect(jsonPath("$.primary").value("gamma"))
+                .andExpect(jsonPath("$.order", Matchers.contains("gamma", "alpha")));
+        assertThat(repository.findById(RoutingSettingsRecord.SINGLETON_ID)).get()
+                .extracting(RoutingSettingsRecord::getPrimaryProvider).isEqualTo("gamma");
     }
 }

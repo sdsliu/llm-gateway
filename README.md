@@ -333,6 +333,7 @@ curl localhost:4000/status/routing
 curl -X PUT localhost:4000/status/routing -H 'Content-Type: application/json' \
      -d '{"mode":"PRIORITY","primary":"openrouter"}'
 curl -X PUT localhost:4000/status/routing -H 'Content-Type: application/json' -d '{"mode":"ROUND_ROBIN"}'
+curl -X DELETE localhost:4000/status/routing   # сбросить к gateway.routing из application.yml
 ```
 
 - `mode` обязателен (`PRIORITY` / `ROUND_ROBIN`, регистр и `-`/`_` не важны); `primary` — имя включённого
@@ -340,7 +341,17 @@ curl -X PUT localhost:4000/status/routing -H 'Content-Type: application/json' -d
 - `order` — порядок, в котором будет перебирать провайдеров следующий запрос.
 - Тот же объект приходит полем `routing` в `GET /status` и в SSE-событии `snapshot`: после `PUT` все открытые
   дашборды обновляются сразу. Смена режима пишется в лог на уровне INFO.
-- **Режим хранится только в памяти**: после рестарта снова берётся `gateway.routing` из `application.yml`.
+- `options` — все настроенные провайдеры (по priority) с живым состоянием: `state` = `healthy` | `cooldown` | `limit` |
+  `no_key`, `until` — до какого момента недоступен, `reason` — причина паузы, `selectable` — можно ли выбрать primary.
+  Провайдер в cooldown / с исчерпанным лимитом **остаётся выбираемым**: выбор сохраняется, пока primary недоступен,
+  запросы идут к следующему по priority, а после конца паузы/сброса лимита — снова к primary (порядок
+  пересчитывается на каждый запрос). Нельзя выбрать только провайдера без api-key (на дашборде он виден, но disabled
+  с подписью «нет ключа»).
+- **Выбор сохраняется в БД** (таблица `routing_settings`, одна строка, миграция Flyway `V3__routing_settings.sql`) и
+  переживает рестарт: при старте шлюз берёт значение из БД, если оно есть, иначе `gateway.routing` из `application.yml`
+  (поле `source`: `DB` / `CONFIG`). Если сохранённый primary больше не годится (провайдер убран из конфига или у него
+  нет api-key) — WARN в логе, `warning` в ответе и порядок из конфига; строка в БД при этом не удаляется — вернётся
+  ключ, вернётся и выбор. `DELETE /status/routing` (кнопка «Сбросить к настройкам из конфига») удаляет сохранённое.
 - **Авторизации нет** (как и у всего `/status` и дашборда): `PUT /status/routing` может вызвать любой, кто достучится
   до порта. Запускайте шлюз локально / в доверенной сети и не публикуйте порт 4000 наружу.
 
