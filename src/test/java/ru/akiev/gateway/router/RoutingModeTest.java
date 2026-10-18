@@ -36,6 +36,8 @@ class RoutingModeTest {
         final ProviderState state = new ProviderState(null);
         final AtomicInteger calls = new AtomicInteger();
         volatile int failWith;
+        /** Текст ошибки (например «No endpoints found» для 404 OpenRouter); null — «<name> failed». */
+        volatile String failMessage;
 
         Fake(String name, int priority) {
             this.name = name;
@@ -50,14 +52,15 @@ class RoutingModeTest {
         public ChatResponse chat(ChatRequest request) {
             calls.incrementAndGet();
             if (failWith != 0) {
-                throw new ProviderException(failWith, name + " failed", null);
+                throw new ProviderException(failWith, failMessage != null ? failMessage : name + " failed", null);
             }
             return new ChatResponse(name, "chat.completion", 1L, "m-" + name, List.of(), null);
         }
 
         public Flux<String> chatStream(ChatRequest request) {
             calls.incrementAndGet();
-            return failWith != 0 ? Flux.error(new ProviderException(failWith, name + " failed", null))
+            return failWith != 0
+                    ? Flux.error(new ProviderException(failWith, failMessage != null ? failMessage : name + " failed", null))
                     : Flux.just("{\"id\":\"" + name + "\"}");
         }
     }

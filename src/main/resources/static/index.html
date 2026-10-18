@@ -31,10 +31,15 @@
     <select id="primary"><option value="">— по приоритету —</option></select>
   </label>
   <div class="rt-state"><span id="rt-current" class="muted">Загрузка…</span><span id="rt-msg"></span></div>
+  <div class="rt-state"><span id="rt-source"></span>
+    <button id="rt-reset" type="button" class="btn" hidden>Сбросить к настройкам из конфига</button></div>
+  <div id="rt-warn" class="rt-warn" hidden></div>
 </section>
-<p class="hint">По приоритету: primary (если выбран) первым, остальные по <code>priority</code>. Round-robin: по кругу среди доступных
-  сейчас (cooldown/лимит пропускаются), primary игнорируется, при ошибке — failover на следующего. Режим хранится в памяти:
-  после рестарта снова берётся <code>gateway.routing</code> из application.yml.</p>
+<p class="hint">По приоритету: primary (если выбран) первым, остальные по <code>priority</code>. Если primary сейчас недоступен
+  (лимит исчерпан / пауза после ошибки), он остаётся выбранным: запросы идут к следующему по приоритету, а после сброса лимита
+  или конца паузы — автоматически снова к primary. Провайдеры без ключа видны в списке, но выбрать их нельзя.
+  Round-robin: по кругу среди доступных сейчас, primary игнорируется, при ошибке — failover на следующего.
+  Выбор сохраняется в БД и переживает рестарт; «Сбросить» возвращает <code>gateway.routing</code> из application.yml.</p>
 
 <h2>Провайдеры <button id="ping-all" class="btn">Пинговать всех</button></h2>
 <p class="hint">Ping — это <code>GET {base-url}/models</code> (путь настраивается через <code>ping-path</code>): токены не тратит. Любой ответ 2xx = доступен; 404/405 = доступен, но список моделей провайдер не отдаёт. «неизвестно» значит, что провайдер эти данные не сообщает, мы их не придумываем.

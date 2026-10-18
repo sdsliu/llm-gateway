@@ -106,44 +106,103 @@ function renderProviders(list) {
   }).join('');
 }
 
-// Режим роутинга: состояние приходит в snapshot (SSE) и в ответе PUT /status/routing.
+// Режим роутинга: состояние приходит в snapshot (SSE) и в ответе GET/PUT/DELETE /status/routing.
+// Выбор сохраняется в БД и переживает рестарт; «Сбросить» (DELETE) возвращает gateway.routing из конфига.
 const MODE_RU = { PRIORITY: 'по приоритету', ROUND_ROBIN: 'round-robin' };
 let routingBusy = false;
+
+// «HH:MM», а если не сегодня — «дд.мм HH:MM».
+function hhmm(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  const t = d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+  return d.toDateString() === new Date().toDateString() ? t
+    : d.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' }) + ' ' + t;
+}
+
+// Живое состояние провайдера для списка primary и строки порядка. '' — здоров.
+function optState(o) {
+  if (!o) return '';
+  switch (o.state) {
+    case 'no_key': return 'нет ключа';
+    case 'limit': return `лимит исчерпан до ${hhmm(o.until)}`;
+    case 'cooldown':
+      return /remaining|429/.test(o.reason ?? '') ? `лимит исчерпан до ${hhmm(o.until)}`
+        : `пауза до ${hhmm(o.until)}${o.reason ? ' (' + o.reason + ')' : ''}`;
+    default: return '';
+  }
+}
 
 function renderRouting(r) {
   if (routingBusy) return; // не перетираем выбор, пока ждём ответ PUT
   document.querySelectorAll('#routing input[name=mode]').forEach(i => { i.checked = i.value === r.mode; });
   const sel = document.getElementById('primary');
-  const opts = ['', ...r.providers];
-  if (sel.options.length !== opts.length || [...sel.options].some((o, i) => o.value !== opts[i])) {
-    sel.innerHTML = opts.map(n => `<option value="${esc(n)}">${n ? esc(n) : '— по приоритету —'}</option>`).join('');
-  }
+  const options = r.options ?? r.providers.map(n => ({ name: n, selectable: true, state: 'healthy' }));
+  const byName = Object.fromEntries(options.map(o => [o.name, o]));
+  // Недоступные сейчас (cooldown/лимит) остаются выбираемыми — выбор сохраняется, роутер вернётся к ним сам.
+  // Без ключа — видны, но disabled: запрос к такому провайдеру не уйдёт.
+  const html = '<option value="">— по приоритету —</option>' + options.map(o => {
+    const st = optState(o);
+    const label = o.name + (o.keyless && o.state === 'healthy' ? ' · keyless' : '') + (st ? ' — ' + st : '');
+    return `<option value="${esc(o.name)}"${o.selectable ? '' : ' disabled'} data-state="${esc(o.state)}">${esc(label)}</option>`;
+  }).join('');
+  if (sel.dataset.html !== html) { sel.innerHTML = html; sel.dataset.html = html; }
   sel.value = r.primary ?? '';
   sel.disabled = r.mode !== 'PRIORITY';
+
+  const orderHtml = r.order.length ? r.order.map(n => {
+    const st = optState(byName[n]);
+    return st ? `<span class="rt-off">${esc(n)} <small>(${esc(st)})</small></span>` : `<b>${esc(n)}</b>`;
+  }).join(' → ') : '<span class="muted">нет провайдеров</span>';
+  let note = '';
+  const prim = r.mode === 'PRIORITY' && r.primary ? byName[r.primary] : null;
+  if (prim && prim.state !== 'healthy') {
+    const next = r.order.find(n => byName[n]?.state === 'healthy');
+    note = `<div class="rt-note">primary <b>${esc(prim.name)}</b> сейчас недоступен (${esc(optState(prim))}) — запросы идут на `
+      + (next ? `<b>${esc(next)}</b>` : 'следующего доступного')
+      + `, к ${esc(prim.name)} вернёмся автоматически после сброса лимита/паузы. Выбор сохранён.</div>`;
+  }
   document.getElementById('rt-current').innerHTML = `Сейчас: <b>${MODE_RU[r.mode] ?? esc(r.mode)}</b>`
     + (r.mode === 'PRIORITY' ? ` · primary: <b>${r.primary ? esc(r.primary) : '—'}</b>` : '')
-    + ` · следующий запрос: ${r.order.length ? r.order.map(esc).join(' → ') : '<span class="muted">нет провайдеров</span>'}`;
+    + ` · следующий запрос: ${orderHtml}` + note;
+
+  const cfg = r.config ? `${MODE_RU[r.config.mode] ?? esc(r.config.mode)}${r.config.primary ? ', primary ' + esc(r.config.primary) : ''}` : '';
+  document.getElementById('rt-source').innerHTML = r.source === 'DB'
+    ? `<span class="ok">✔ сохранено в БД — переживёт рестарт</span>`
+    : `<span class="muted">из конфига (gateway.routing${cfg ? ': ' + cfg : ''})</span>`;
+  const reset = document.getElementById('rt-reset');
+  reset.hidden = r.source !== 'DB';
+  reset.title = cfg ? 'Вернуть gateway.routing из application.yml: ' + cfg.replace(/<[^>]+>/g, '') : '';
+  const warn = document.getElementById('rt-warn');
+  warn.textContent = r.warning ?? '';
+  warn.hidden = !r.warning;
 }
 
-async function saveRouting() {
-  const mode = document.querySelector('#routing input[name=mode]:checked')?.value;
-  const primary = document.getElementById('primary').value || null;
+async function sendRouting(method, body) {
   const msg = document.getElementById('rt-msg');
   routingBusy = true; msg.textContent = 'сохраняю…'; msg.className = '';
   try {
     const r = await fetch('/status/routing', {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode, primary }),
+      method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined,
     });
-    const body = await r.json();
+    const res = await r.json();
     routingBusy = false;
-    if (!r.ok) { msg.textContent = body.error?.message ?? ('HTTP ' + r.status); msg.className = 'bad'; return; }
-    renderRouting(body);
-    msg.textContent = 'сохранено'; msg.className = 'ok';
+    if (!r.ok) { msg.textContent = res.error?.message ?? ('HTTP ' + r.status); msg.className = 'bad'; return; }
+    renderRouting(res);
+    msg.textContent = method === 'DELETE' ? 'сброшено к конфигу' : 'сохранено'; msg.className = 'ok';
   } catch (err) {
     routingBusy = false; msg.textContent = String(err); msg.className = 'bad';
   }
 }
 
+function saveRouting(e) {
+  if (e.target.id === 'rt-reset') return;
+  const mode = document.querySelector('#routing input[name=mode]:checked')?.value;
+  const primary = document.getElementById('primary').value || null;
+  sendRouting('PUT', { mode, primary });
+}
+
+document.getElementById('rt-reset').addEventListener('click', () => sendRouting('DELETE'));
 document.getElementById('routing').addEventListener('change', saveRouting);
 fetch('/status/routing').then(r => r.json()).then(renderRouting).catch(() => {});
 
