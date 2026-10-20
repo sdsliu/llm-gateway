@@ -13,23 +13,40 @@ import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBo
 import ru.akiev.gateway.dto.ErrorResponse;
 import ru.akiev.gateway.provider.ProviderException;
 import ru.akiev.gateway.router.StreamSession;
-import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import ru.akiev.gateway.usage.RequestTags;
-import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import ru.akiev.gateway.dto.ChatRequest;
 import ru.akiev.gateway.dto.ChatResponse;
-import ru.akiev.gateway.dto.ModelInfo;
-import ru.akiev.gateway.dto.ModelList;
+import java.util.List;
+import org.springframework.http.ResponseEntity;
+import ru.akiev.gateway.api.generated.api.OpenaiApi;
+import ru.akiev.gateway.api.generated.model.ModelInfo;
+import ru.akiev.gateway.api.generated.model.ModelList;
 import ru.akiev.gateway.router.ProviderRouter;
 
-/** OpenAI-совместимые эндпоинты шлюза. */
+/**
+ * OpenAI-совместимые эндпоинты шлюза.
+ *
+ * <p><b>API first.</b> Контракт — {@code src/main/resources/openapi/llm-gateway.yaml}. Класс реализует
+ * сгенерированный из него интерфейс {@link OpenaiApi}: путь, метод, параметры и тип ответа {@code GET /v1/models}
+ * берутся из интерфейса (аннотации {@code @RequestMapping} наследуются от него), поэтому здесь их нет.
+ *
+ * <p>{@code POST /v1/chat/completions} — исключение, он написан вручную (в контракте помечен {@code x-internal: true},
+ * генератор для него метод не создаёт). Причины:
+ * <ul>
+ *   <li>один и тот же эндпоинт отдаёт либо JSON ({@code stream=false}), либо поток {@code text/event-stream}
+ *       ({@code stream=true}); генератор умеет только один Java-тип ответа ({@code ResponseEntity<ChatResponse>}),
+ *       а для стрима нужен {@link StreamingResponseBody} — поэтому метод возвращает {@code Object};</li>
+ *   <li>тело запроса — внутренний {@link ChatRequest} со своей логикой (streamRequested, withModel, ...), его
+ *       нельзя заменить сгенерированным POJO без риска изменить то, что уходит провайдеру.</li>
+ * </ul>
+ * Соответствие ручного метода контракту (путь и метод есть в YAML) проверяет {@code ContractMappingTest}.
+ */
 @RestController
-@RequestMapping("/v1")
-public class ChatController {
+public class ChatController implements OpenaiApi {
 
     private static final Logger log = LoggerFactory.getLogger(ChatController.class);
 
@@ -49,7 +66,7 @@ public class ChatController {
      * <p>Заголовки x-run-id / x-issue / x-client и поле user из тела привязываются к потоку
      * ({@link RequestTags}) — так каждая попытка в usage_record получает метки прогона.
      */
-    @PostMapping("/chat/completions")
+    @PostMapping("/v1/chat/completions")
     public Object chat(@Valid @RequestBody ChatRequest request, HttpServletResponse response,
             @RequestHeader(value = "x-run-id", required = false) String runId,
             @RequestHeader(value = "x-issue", required = false) String issue,
@@ -102,11 +119,21 @@ public class ChatController {
         }
     }
 
-    @GetMapping("/models")
-    public ModelList models() {
-        return ModelList.of(router.providers().stream()
-                .flatMap(p -> p.models().stream().map(m -> ModelInfo.of(m, p.name())))
-                .distinct()
-                .toList());
+    /**
+     * GET /v1/models — реализация метода сгенерированного интерфейса. Параметр {@code authorization}
+     * объявлен в контракте ради совместимости с OpenAI SDK; шлюз его не проверяет.
+     */
+    @Override
+    public ResponseEntity<ModelList> listModels(String authorization) {
+        return ResponseEntity.ok(new ModelList()._object("list").data(models()));
+    }
+
+    /** Модели всех провайдеров без дублей (используется и в GET /status/models). */
+    public List<ModelInfo> models() {
+        return router.providers().stream()
+                .flatMap(p -> p.models().stream()
+                        .map(m -> new ModelInfo().id(m)._object("model").created(0L).ownedBy(p.name())))
+                .distinct() // сгенерированные модели реализуют equals/hashCode по всем полям, как record раньше
+                .toList();
     }
 }
