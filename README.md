@@ -505,10 +505,68 @@ gateway:
 Также можно ограничить провайдера `max-concurrency` (сколько запросов держать в полёте). У OVH в конфиге
 стоит `2` — столько же, сколько анонимных запросов в минуту.
 
+## API first: OpenAPI-контракт
+
+HTTP API шлюза описано **сначала в контракте**, а код подстраивается под него — не наоборот.
+
+- **Где контракт:** [`src/main/resources/openapi/llm-gateway.yaml`](src/main/resources/openapi/llm-gateway.yaml)
+  (OpenAPI 3.0.3, описания на русском). Это единственный источник правды: все пути, параметры, заголовки
+  (`x-run-id`, `x-issue`, `x-client`), тела запросов/ответов и коды ошибок (400, 404, 413, 429, 503).
+- **Swagger UI:** <http://localhost:4000/swagger-ui.html> — показывает именно этот файл (его же можно скачать:
+  <http://localhost:4000/openapi/llm-gateway.yaml>). `/v3/api-docs` — то, что springdoc построил по коду
+  контроллеров; полезно для сравнения, но правда — YAML.
+
+### Как это устроено
+
+1. `openapi-generator-maven-plugin` (см. `pom.xml`) на фазе `generate-sources` читает YAML и генерирует в
+   `target/generated-sources/openapi` (в git не попадает — всегда воспроизводится из YAML):
+   - **интерфейсы** `ru.akiev.gateway.api.generated.api` — по одному на тег: `OpenaiApi`, `StatusApi`,
+     `RoutingApi`, `ProvidersApi`, `StatsApi`. На методах уже стоят `@RequestMapping`, `@RequestParam`,
+     `@PathVariable`, `@RequestHeader`, `@Valid` — Spring MVC наследует эти аннотации от интерфейса;
+   - **модели** `ru.akiev.gateway.api.generated.model`: `RoutingUpdate`, `ModelInfo`, `ModelList`, `AllModels`,
+     `SpringError`.
+2. Контроллеры пишут `implements XxxApi` и только `@Override`-ят методы. Аннотаций путей в них нет.
+   Опция `skipDefaultInterface=true` убирает «заглушки 501»: забыли реализовать метод или контракт поменял
+   сигнатуру — **ошибка компиляции**.
+3. Остальные схемы (`StatusSnapshot`, `RoutingInfo`, `PingResult`, `ModelsCache`, `RunStats`, `EfficiencyReport`,
+   `ChatRequest`/`ChatResponse`, `ErrorResponse`) сопоставлены существующим Java-record'ам через
+   `schemaMappings` — генератор подставляет их в сигнатуры интерфейсов, а не создаёт копии. Эти record'ы
+   используются внутри шлюза (роутер, SSE, статистика) и уже пишут ровно тот JSON, что в контракте
+   (snake_case, `Instant`, `primary` всегда присутствует). Копии + мапперы дали бы больше кода и новое место
+   для расхождений.
+
+### Что написано вручную и почему
+
+| Операция | Почему не через сгенерированный интерфейс |
+|---|---|
+| `POST /v1/chat/completions` | Один эндпоинт отдаёт либо JSON, либо поток `text/event-stream` (`stream: true`), а генератор умеет только один Java-тип ответа. Тело — внутренний `ChatRequest` (логика `streamRequested()`, `withModel()` и т.п.). |
+| `GET /status/stream` | Возвращает `SseEmitter` (долгое SSE-соединение), генератор такого типа не знает. |
+
+Обе операции **описаны в контракте**, но помечены `x-internal: true` — так генератор их пропускает.
+Чтобы ручной код не «уплыл» от контракта, есть тесты-стражи (`src/test/java/ru/akiev/gateway/contract`):
+
+- `ContractMappingTest` — множество «метод + путь» из YAML должно **точно** совпадать с эндпоинтами, которые
+  зарегистрировал Spring MVC (лишний эндпоинт без контракта — тоже падение);
+- `ContractSchemaTest` — для каждого record'а из `schemaMappings` имена JSON-свойств (как их увидит Jackson)
+  должны совпадать с `properties` схемы в YAML.
+
+> Ограничение (было и до API first): `ChatRequest`/`ChatResponse` — подмножество OpenAI API. Неизвестные поля
+> (`tools`, `response_format`, …) принимаются без 400, но провайдеру не пересылаются; лишние поля ответа
+> провайдера клиенту не доходят. Контракт это честно описывает.
+
+### Как поменять API
+
+1. Отредактировать `src/main/resources/openapi/llm-gateway.yaml` (новый путь, параметр, поле схемы…).
+2. `./mvnw generate-sources` — перегенерировать интерфейсы/модели (IDE подхватит `target/generated-sources/openapi`;
+   в IntelliJ: Maven → Reload project).
+3. Реализовать: компилятор покажет контроллеры, которые больше не соответствуют интерфейсам. Если поменялась
+   схема, сопоставленная record'у, — поправить record (подскажет `ContractSchemaTest`).
+4. `./mvnw verify` — стражи контракта и остальные тесты.
+
 ## Тесты
 
 ```bash
-./mvnw test     # быстрые unit/slice-тесты на H2 (≈40 шт., Docker не нужен)
+./mvnw test     # быстрые unit/slice-тесты на H2 (≈190 шт., Docker не нужен), включая стражи контракта
 ./mvnw verify   # + интеграционные *IT: Testcontainers PostgreSQL 16 + WireMock (нужен Docker)
 ```
 
@@ -520,16 +578,18 @@ failover 429 → второй провайдер, записи в `usage_record`
 
 ```
 src/main/java/ru/akiev/gateway/
-├── api/        ChatController (/v1/*), ApiExceptionHandler (ошибки в формате OpenAI)
+├── api/        ChatController (/v1/*), ApiExceptionHandler (ошибки в формате OpenAI), InvalidRequestException
 ├── config/     GatewayProperties, ProviderProperties, ProviderConfig (сборка провайдеров и роутера)
-├── dto/        ChatRequest/Response, Message, Choice, Usage, ModelList, ErrorResponse
+├── dto/        ChatRequest/Response, Message, Choice, Usage, ErrorResponse
 ├── provider/   LlmProvider, OpenAiCompatibleProvider (WebClient), ProviderState, RateLimitHeaders
 ├── router/     ProviderRouter (группы, headroom − in-flight, failover), StreamSession, RouterListener
 ├── usage/      UsageRecord (JPA), UsageService, LimitTracker (RPM/RPD)
 ├── status/     StatusService, StatusController (/status, /status/stream), StatusBroadcaster (SSE),
 │               OpenRouterKeyPoller
 └── telegram/   зарезервировано (бот отложен)
+target/generated-sources/openapi/   сгенерировано из контракта (api/ — интерфейсы, model/ — DTO), не в git
 src/main/resources/
+├── openapi/llm-gateway.yaml   OpenAPI-контракт (API first, источник правды)
 ├── application.yml
 ├── db/migration/V1__usage_record.sql
 └── static/     index.html, app.js, style.css (дашборд)
