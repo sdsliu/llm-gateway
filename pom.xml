@@ -78,7 +78,7 @@
                 больше кода и новый источник расхождений. Соответствие record'ов контракту проверяет
                 тест ContractSchemaTest.
               -->
-              <modelsToGenerate>RoutingUpdate,ModelInfo,ModelList,AllModels</modelsToGenerate>
+              <modelsToGenerate>RoutingUpdate,ModelInfo,ModelList,AllModels,SpringError</modelsToGenerate>
               <schemaMappings>
                 StatusSnapshot=ru.akiev.gateway.status.StatusSnapshot,
                 RoutingInfo=ru.akiev.gateway.status.RoutingInfo,
