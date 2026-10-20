@@ -259,6 +259,14 @@ gateway:
         input-per-million: 0.15
         output-per-million: 0.60
 
+# API first: Swagger UI (/swagger-ui.html) показывает контракт src/main/resources/openapi/llm-gateway.yaml
+# (его раздаёт OpenApiContractConfig по /openapi/llm-gateway.yaml). /v3/api-docs — то, что springdoc
+# построил по коду контроллеров; удобно сравнить с контрактом, но источник правды — YAML.
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+    url: /openapi/llm-gateway.yaml
+
 management:
   endpoints:
     web:
