@@ -192,15 +192,26 @@ public class LimitDiscoveryService implements SmartInitializingSingleton {
                 s.recordRequest(now); // крошечный chat — тоже запрос в счёт RPM/RPD
             }
         }
-        boolean returned = s.excluded() || s.pausedBy429At(now) != null;
+        // Паузу после 429 успешный ping не снимает: GET /models у SambaNova отвечает 200,
+        // пока chat ещё в лимите. Ждём Retry-After / default-cooldown, иначе следующий запрос снова получит 429.
+        Instant rateLimitUntil = s.cooldownUntil();
+        boolean rateHold = s.pausedBy429At(now) != null && rateLimitUntil != null && now.isBefore(rateLimitUntil);
+        String rateReason = s.cooldownReason();
+        boolean returned = s.excluded();
         if (returned) {
             s.include();
+            if (rateHold) {
+                s.pauseAfter429(now, rateLimitUntil, rateReason != null ? rateReason : "HTTP 429");
+            }
         }
         String status = r.httpStatus() != null ? "HTTP " + r.httpStatus() : "без запроса";
         String note = r.error() != null ? "; " + r.error() : "";
-        if (returned) {
+        if (returned && !rateHold) {
             log.info("Провайдер {} снова отвечает ({} → {}, {} мс) — возвращён в роутинг. Лимиты: {}",
                     p.name(), r.method(), status, r.latencyMs(), s.effectiveLimits());
+        } else if (rateHold) {
+            log.info("Провайдер {} отвечает на ping ({} → {}), но пауза после 429 до {} — в чат не пускаем",
+                    p.name(), r.method(), status, s.cooldownUntil());
         } else {
             log.info("Провайдер {}: доступен ({} → {}, {} мс{}). Лимиты: {}", p.name(), r.method(), status,
                     r.latencyMs(), note, s.effectiveLimits());

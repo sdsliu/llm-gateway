@@ -12,7 +12,7 @@
 
 ```
 клиент (curl/Aider) → ChatController.chat() → OpenAiCompatibleProvider.chat()
-   → webClient.post()...bodyToMono(ChatResponse.class).timeout(120s).block()
+   → webClient.post()...bodyToMono(ChatResponse.class).timeout(30s).block()
    → Groq / любой OpenAI-совместимый API
 ```
 

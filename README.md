@@ -134,7 +134,8 @@ Ping по расписанию: `gateway.health.scheduled=true` (интерва�
 
 ```yaml
 gateway:
-  default-cooldown: 5m            # пауза после 429/5xx/402/таймаута без Retry-After
+  default-cooldown: 5m            # пауза после 429/5xx/402/таймаута без Retry-After (и при Retry-After: 0)
+  model-unavailable-cooldown: 10m # 404 «model unavailable» — не звать участника в этой группе
   openrouter:
     name: openrouter              # какой провайдер опрашивать через GET /key
     poll-interval: PT5M           # ISO-8601
@@ -148,7 +149,7 @@ gateway:
       api-key: ${GROQ_API_KEY:}
       model: openai/gpt-oss-120b
       priority: 1                 # меньше = раньше
-      timeout: 120s               # non-stream: на весь ответ; stream: пауза между чанками
+      timeout: 30s                # non-stream: на весь ответ; stream: пауза между чанками
       stream-usage: true          # слать stream_options.include_usage
       limits:
         rpm: 30                   # собственные лимиты шлюза (0/нет = без лимита)
@@ -163,10 +164,11 @@ gateway:
 | `api-key-optional` | нет (false) | `true` — keyless-провайдер: при пустом `api-key` не пропускается, запросы идут без `Authorization` |
 | `model` | да | реальная модель провайдера (подменяет модель клиента) |
 | `priority` | нет (100) | порядок перебора |
-| `timeout` | нет (120s) | таймаут запроса к этому провайдеру (non-stream — весь ответ, stream — до/между чанками); истёк → 504, cooldown и failover |
+| `timeout` | нет (30s) | таймаут запроса к этому провайдеру (non-stream — весь ответ, stream — до/между чанками); истёк → 504, cooldown и failover. Держите его заметно ниже read-timeout клиента (у Nori это ~120 с): иначе зависший участник группы съедает весь бюджет, и failover приходит слишком поздно. У groq / openrouter / sambanova в конфиге 30 с |
 | `extra-body` | нет | доп. поля верхнего уровня в теле `/chat/completions` только для этого провайдера (например Z.ai `thinking: {type: disabled}`); `model`, `messages`, `stream`, `stream_options`, `models` не переопределяются |
 | `fallback-models` | нет | запасные модели OpenRouter (поле `models`) |
 | `limits.rpm` / `limits.rpd` | нет | лимиты запросов в минуту/сутки |
+| `max-concurrency` | нет | сколько запросов держать в полёте; сверх этого провайдер пропускается (всплеск уходит другим). `0`/пусто — без ограничения |
 | `stream-usage` | нет (true) | запрашивать usage в стриме |
 | `ping-path` | нет (`/models`) | путь ping дашборда; 404/405 = «доступен, список моделей не поддерживается» |
 
@@ -219,7 +221,9 @@ gateway:
 curl -s localhost:4000/v1/models
 
 curl -s localhost:4000/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"model":"openai/coder","messages":[{"role":"user","content":"Скажи привет"}]}'
+  -d '{"model":"gpt-oss-120b","messages":[{"role":"user","content":"Скажи привет"}]}'
+# то же самое: алиас группы, запрос разъедется по Groq / OVH / SambaNova / OpenRouter
+# -d '{"model":"openai/gpt-oss-120b",...}'
 
 # стриминг
 curl -N localhost:4000/v1/chat/completions -H 'Content-Type: application/json' \
@@ -354,18 +358,23 @@ curl -s 'localhost:4000/stats/efficiency?days=30'
 провайдера сразу, поэтому параллельные запросы не займут один и тот же остаток. После ответа резерв заменяется
 реальным `usage`, а остаток уточняется по `x-ratelimit-remaining-tokens`.
 
-**5. Выбор.** Кандидаты — провайдеры, у которых есть запрошенная модель (`model` + `models`; если модели нет ни у кого —
-все, как раньше) и хватает места по **всем** лимитам. В режиме `HEADROOM` (по умолчанию) побеждает тот, у кого больше
-запас: минимум по всем лимитам величины (остаток − запрос) / лимит. При равенстве решает `priority`. В режимах
-`PRIORITY` и `ROUND_ROBIN` порядок прежний, но провайдер без места пропускается.
+**5. Выбор.** Кандидаты — участники группы моделей (см. ниже), если клиент прислал её имя или алиас; иначе провайдеры,
+у которых есть запрошенная модель (`model` + `models`; если модели нет ни у кого — все, как раньше). Провайдер без места
+по **любому** лимиту пропускается. В режиме `HEADROOM` (по умолчанию) счёт = запас минус число запросов уже в полёте
+(запас — минимум по всем лимитам величины (остаток − запрос) / лимит). Поэтому параллельный всплеск расходится по
+разным провайдерам, а не занимает один и тот же максимум. При равенстве решает `priority`. `max-concurrency` — жёсткий
+потолок слотов в полёте. В режимах `PRIORITY` и `ROUND_ROBIN` порядок прежний (in-flight на счёт не влияет), но
+провайдер без места или с занятым `max-concurrency` пропускается.
 
 **6. Мест нет.**
 - Ни у кого нет места в эту минуту: запрос ждёт освобождения до `gateway.limits.max-wait` (20 с), потом получает
   `429 rate_limit_exceeded` с `Retry-After`.
 - Запрос больше TPM **всех** провайдеров: сразу `413 request_too_large`, ждать бесполезно.
 
-**7. 429 от провайдера**: провайдер встаёт на паузу (до `Retry-After` или `default-cooldown`), запрос уходит к
-следующему. Пауза заканчивается раньше, если провайдер успешно ответит на очередной перепинг (раз в минуту).
+**7. 429 от провайдера**: провайдер встаёт на паузу (до положительного `Retry-After`, иначе `x-ratelimit-reset-*`,
+иначе `default-cooldown`) и **пропускается**, пока пауза не кончится. `Retry-After: 0` не считается «можно сразу»:
+это тот же `default-cooldown`. Успешный ping (`GET /models` часто 200, пока chat ещё в лимите — так у SambaNova)
+паузу **не снимает**. Следующий запрос к группе идёт к другим участникам, а не снова в 429.
 
 **8. Одна модель на попытку** (`gateway.limits.pin-model-per-run: true`): все запросы с одним `x-run-id` уходят к
 одному провайдеру, чтобы агент не менял модель посреди задачи. Если у этого провайдера кончилась минута, запрос ждёт.
@@ -393,12 +402,17 @@ gateway:
 
 | Режим | Порядок перебора |
 |---|---|
-| `HEADROOM` (по умолчанию в `application.yml`) | к провайдеру с наибольшим запасом по лимитам под этот запрос; при равенстве — по `priority`; `primary` игнорируется |
+| `HEADROOM` (по умолчанию в `application.yml`) | к провайдеру с наибольшим запасом по лимитам **минус запросы в полёте**; при равенстве — по `priority`; `primary` игнорируется |
 | `PRIORITY` | по `priority`; если задан `primary`, он идёт первым, остальные — по `priority` |
 | `ROUND_ROBIN` | по кругу среди **доступных сейчас** провайдеров (cooldown/лимит пропускаются, без ключа их и так нет); `primary` игнорируется |
 
 Во всех режимах failover одинаковый: при 429/5xx/таймауте провайдер уходит в cooldown, запрос идёт к следующему
-в текущем порядке. Счётчик round-robin — `AtomicLong`, параллельные запросы распределяются равномерно.
+в текущем порядке. 429 уважает `Retry-After` этого провайдера. Таймаут — свой у каждого провайдера
+(`gateway.providers[].timeout`, по умолчанию 30 с): истёкший даёт 504 и failover, не дожидаясь клиентского
+read-timeout. Внутри группы моделей (и для модели `auto`) то же
+делается для 404/401/403/402: провайдер остывает, пробуем следующего участника; клиент получает 429 только если
+429 ответила вся группа. Обычный 404 вне группы по-прежнему сразу уходит клиенту. Счётчик round-robin —
+`AtomicLong`, параллельные запросы распределяются равномерно.
 
 Значение по умолчанию — в `application.yml`:
 
@@ -409,8 +423,8 @@ gateway:
     primary:            # имя провайдера; пусто — чистый приоритет
 ```
 
-Опечатка в `primary` (такого провайдера нет в `gateway.providers`) — ошибка старта; провайдер без api-key —
-предупреждение в логе и работа по чистому приоритету.
+Опечатка в `primary` (такого провайдера нет в `gateway.providers`) — ошибка старта; провайдер без api-key
+или с битым `base-url` — предупреждение в логе и работа по чистому приоритету.
 
 Смена в runtime — блок **«Режим роутинга»** на дашборде (радио-кнопки режима + выпадающий список primary;
 применяется сразу) или REST:
@@ -430,7 +444,7 @@ curl -X DELETE localhost:4000/status/routing   # сбросить к gateway.rou
 - Тот же объект приходит полем `routing` в `GET /status` и в SSE-событии `snapshot`: после `PUT` все открытые
   дашборды обновляются сразу. Смена режима пишется в лог на уровне INFO.
 - `options` — все настроенные провайдеры (по priority) с живым состоянием: `state` = `healthy` | `cooldown` | `limit` |
-  `excluded` | `no_key`, `until` — до какого момента недоступен, `reason` — причина паузы, `selectable` — можно ли выбрать primary.
+  `excluded` | `no_key` | `invalid`, `until` — до какого момента недоступен, `reason` — причина паузы, `selectable` — можно ли выбрать primary.
   Провайдер в cooldown / с исчерпанным лимитом **остаётся выбираемым**: выбор сохраняется, пока primary недоступен,
   запросы идут к следующему по priority, а после конца паузы/сброса лимита — снова к primary (порядок
   пересчитывается на каждый запрос). Нельзя выбрать только провайдера без api-key (на дашборде он виден, но disabled
@@ -442,6 +456,54 @@ curl -X DELETE localhost:4000/status/routing   # сбросить к gateway.rou
   ключ, вернётся и выбор. `DELETE /status/routing` (кнопка «Сбросить к настройкам из конфига») удаляет сохранённое.
 - **Авторизации нет** (как и у всего `/status` и дашборда): `PUT /status/routing` может вызвать любой, кто достучится
   до порта. Запускайте шлюз локально / в доверенной сети и не публикуйте порт 4000 наружу.
+
+## Группы моделей
+
+Один логический id на несколько провайдеров. У каждого участника свой model id: шлюз подставляет его в тело
+запроса. Так клиент, который шлёт `openai/gpt-oss-120b`, не застревает на одном Groq.
+
+```yaml
+gateway:
+  model-groups:
+    - name: gpt-oss-120b          # это имя (или алиас) шлёт клиент, в том числе Nori
+      aliases:
+        - openai/gpt-oss-120b     # тот же id, что у Groq — тоже попадает в группу, а не только на Groq
+      members:
+        - provider: groq
+          model: openai/gpt-oss-120b
+        - provider: ovh
+          model: gpt-oss-120b
+        - provider: sambanova
+          model: gpt-oss-120b
+        - provider: openrouter
+          model: openai/gpt-oss-120b        # платный id; :free → 404 «unavailable for free»
+```
+
+Имя модели `auto` (если нет группы с таким именем) значит «любой включённый провайдер, каждому его модель из конфига».
+
+Участнику группы уходит **ровно** его `model`. Запасной список OpenRouter (`models` из `fallback-models`) для такого
+вызова не отправляется, `route: fallback` снимается, а в тело OpenRouter добавляется
+`provider.allow_fallbacks: false` — иначе OpenRouter отвечает своей запасной моделью (nemotron, poolside/laguna, flint),
+иногда ещё и не JSON. Ответ с другим полем `model` (или не-JSON до первого чанка стрима) — сбой этой попытки:
+провайдер в cooldown, запрос идёт следующему участнику. Суффикс варианта считается той же моделью
+(`openai/gpt-oss-120b:free` и `openai/gpt-oss-120b`). Прямой вызов OpenRouter не из группы по-прежнему шлёт `fallback-models`.
+
+404 с текстом «unavailable» или «No endpoints found» помечает участника недоступным **в этой группе** на
+`gateway.model-unavailable-cooldown` (по умолчанию 10 минут). Следующие запросы группы его не вызывают, даже если
+провайдерный cooldown уже снят или ping ответил 200. Обычный 404 («Not Found») по-прежнему только короткий cooldown
+провайдера. Вне группы 404 «unavailable» клиенту, без этой паузы.
+
+Что слать Nori: **`gpt-oss-120b`** или алиас **`openai/gpt-oss-120b`**. Оба имени есть в `GET /v1/models`.
+Неизвестная модель по-прежнему означает «все провайдеры», но обычный 404 тогда не вызывает failover —
+для всплеска нужно имя группы.
+
+Провайдер с пустым `api-key` (и без `api-key-optional`) или с битым `base-url` при старте **отключается**
+с `WARN` и в группу не входит. Пример: пустой `CLOUDFLARE_ACCOUNT_ID` даёт
+`https://api.cloudflare.com/client/v4/accounts//ai/v1` (пустой сегмент пути) — Cloudflare не попадёт в роутинг
+и не заберёт на себя весь всплеск с 404.
+
+Также можно ограничить провайдера `max-concurrency` (сколько запросов держать в полёте). У OVH в конфиге
+стоит `2` — столько же, сколько анонимных запросов в минуту.
 
 ## Тесты
 
@@ -462,7 +524,7 @@ src/main/java/ru/akiev/gateway/
 ├── config/     GatewayProperties, ProviderProperties, ProviderConfig (сборка провайдеров и роутера)
 ├── dto/        ChatRequest/Response, Message, Choice, Usage, ModelList, ErrorResponse
 ├── provider/   LlmProvider, OpenAiCompatibleProvider (WebClient), ProviderState, RateLimitHeaders
-├── router/     ProviderRouter (приоритет + failover), StreamSession (стриминг), RouterListener
+├── router/     ProviderRouter (группы, headroom − in-flight, failover), StreamSession, RouterListener
 ├── usage/      UsageRecord (JPA), UsageService, LimitTracker (RPM/RPD)
 ├── status/     StatusService, StatusController (/status, /status/stream), StatusBroadcaster (SSE),
 │               OpenRouterKeyPoller

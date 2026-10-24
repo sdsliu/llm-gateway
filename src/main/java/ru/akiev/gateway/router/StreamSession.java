@@ -3,6 +3,7 @@ package ru.akiev.gateway.router;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.Iterator;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Stream;
 import ru.akiev.gateway.dto.ChatResponse;
 import ru.akiev.gateway.dto.Usage;
@@ -20,6 +21,26 @@ public class StreamSession implements AutoCloseable {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
+    /**
+     * Поле {@code model} первого чанка. {@code json == false} — чанк не JSON (для группы это сбой попытки).
+     * {@code model == null} — JSON без модели, проверить подмену нельзя.
+     */
+    record ChunkModel(boolean json, String model) {
+    }
+
+    static ChunkModel parseChunk(String json) {
+        try {
+            JsonNode n = MAPPER.readTree(json);
+            if (n != null && n.isObject() && n.hasNonNull("model")) {
+                String text = n.get("model").asText("").trim();
+                return new ChunkModel(true, text.isEmpty() ? null : text);
+            }
+            return new ChunkModel(true, null);
+        } catch (Exception e) {
+            return new ChunkModel(false, null);
+        }
+    }
+
     private final LlmProvider provider;
     private final Stream<String> stream;
     private final Iterator<String> iterator;
@@ -27,6 +48,9 @@ public class StreamSession implements AutoCloseable {
     private final long startNanos;
     private final boolean forwardUsageChunks;
     private final RouterListener listener;
+    /** Отпустить in-flight слот провайдера, когда стрим дочитан или закрыт. Один раз. */
+    private final Runnable onFinished;
+    private final AtomicBoolean finishedOnce = new AtomicBoolean();
 
     private String model;
     private String id;
@@ -34,7 +58,7 @@ public class StreamSession implements AutoCloseable {
     private boolean finished;
 
     StreamSession(LlmProvider provider, Stream<String> stream, Iterator<String> iterator, String firstChunk,
-            long startNanos, boolean forwardUsageChunks, RouterListener listener) {
+            long startNanos, boolean forwardUsageChunks, RouterListener listener, Runnable onFinished) {
         this.provider = provider;
         this.stream = stream;
         this.iterator = iterator;
@@ -42,6 +66,7 @@ public class StreamSession implements AutoCloseable {
         this.startNanos = startNanos;
         this.forwardUsageChunks = forwardUsageChunks;
         this.listener = listener;
+        this.onFinished = onFinished;
     }
 
     public LlmProvider provider() {
@@ -77,6 +102,8 @@ public class StreamSession implements AutoCloseable {
             listener.onFailure(provider, new ProviderException(499, "Client disconnected: " + e.getMessage(), e),
                     elapsedMs());
             throw e;
+        } finally {
+            finish();
         }
     }
 
@@ -123,7 +150,17 @@ public class StreamSession implements AutoCloseable {
     /** Закрытие Stream отменяет подписку на Flux → WebClient закрывает соединение с провайдером. */
     @Override
     public void close() {
-        stream.close();
+        try {
+            stream.close();
+        } finally {
+            finish();
+        }
+    }
+
+    private void finish() {
+        if (onFinished != null && finishedOnce.compareAndSet(false, true)) {
+            onFinished.run();
+        }
     }
 
     public boolean finished() {

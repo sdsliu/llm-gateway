@@ -24,7 +24,12 @@ spring:
 
 gateway:
   # Пауза для провайдера после 429/5xx/таймаута, если он не прислал Retry-After
+  # (и если Retry-After: 0 — иначе провайдер выбирался бы на каждый следующий запрос).
+  # Успешный ping эту паузу не снимает раньше срока: GET /models может быть 200, пока chat в лимите.
   default-cooldown: 5m
+  # 404 «model unavailable» / «No endpoints found» у участника группы: не звать его в этой группе.
+  # Ping провайдера паузу не снимает.
+  model-unavailable-cooldown: 10m
   # Режим выбора провайдера по умолчанию. С дашборда / PUT /status/routing меняется и сохраняется в БД
   # (таблица routing_settings) — переживает рестарт и имеет приоритет над этим блоком.
   # «Сбросить к настройкам из конфига» (DELETE /status/routing) удаляет сохранённое — снова действует этот блок.
@@ -69,7 +74,9 @@ gateway:
       api-key: ${GROQ_API_KEY:}
       model: openai/gpt-oss-120b
       priority: 1
-      timeout: 120s
+      # Короче клиентского таймаута (Nori ~120s): зависший участник группы отдаёт 504 и failover,
+      # а не съедает весь бюджет клиента. То же у openrouter и sambanova.
+      timeout: 30s
       # Fallback: при старте Groq сообщает реальные лимиты в x-ratelimit-* (limit-requests = RPD, limit-tokens = TPM).
       limits:
         rpm: 30
@@ -126,6 +133,8 @@ gateway:
       timeout: 60s
       limits:
         rpm: ${OVH_AI_RPM:2}
+      # Анонимный лимит — 2 запроса в минуту: не держим в полёте больше двух, остальной всплеск уходит другим.
+      max-concurrency: 2
     # Cloudflare Workers AI: OpenAI-совместимые эндпоинты
     # https://developers.cloudflare.com/workers-ai/configuration/open-ai-compatibility/
     # Нужны CLOUDFLARE_API_TOKEN (права Workers AI: Read/Edit) и CLOUDFLARE_ACCOUNT_ID; без токена — пропускается.
@@ -137,7 +146,8 @@ gateway:
     # поэтому rpd не задаём: исчерпание квоты = ошибка от Cloudflare -> cooldown и failover.
     # Списка моделей в OpenAI-формате нет: GET {base-url}/models отвечает 405 (маршруты /ai/v1/* — только POST),
     # а ping считает 404/405 «сервер ответил — доступен» (без списка моделей). Поэтому ping-path по умолчанию.
-    # Без CLOUDFLARE_ACCOUNT_ID URL получится битым (/accounts//ai/v1) — задавайте обе переменные.
+    # Без CLOUDFLARE_ACCOUNT_ID URL получится битым (/accounts//ai/v1). Такой провайдер отключается при старте
+    # с WARN (пустой сегмент пути), в роутинг не попадает. Задавайте обе переменные.
     - name: cloudflare
       base-url: https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID:}/ai/v1
       api-key: ${CLOUDFLARE_API_TOKEN:}
@@ -162,7 +172,8 @@ gateway:
         - poolside/laguna-s-2.1:free
         - openrouter/free
       priority: 6
-      timeout: 120s
+      # 30s, не 120s: иначе failover внутри группы не успевает до таймаута клиента.
+      timeout: 30s
       limits:
         rpm: 20
         rpd: 50
@@ -180,7 +191,8 @@ gateway:
       api-key: ${SAMBANOVA_API_KEY:}
       model: gpt-oss-120b
       priority: 7
-      timeout: 120s
+      # 30s, не 120s: SambaNova часто молчит до клиентского таймаута, и failover уже некому отдать.
+      timeout: 30s
       limits:
         rpm: 20
         rpd: 20
@@ -197,6 +209,33 @@ gateway:
     #   limits:
     #     rpm: 6
     #     tokens-per-month: 1000000
+
+  # Логические модели: одно имя клиента → несколько провайдеров, каждому свой model id.
+  # Клиент (Nori и др.) шлёт name или alias. Шлюз переписывает model и в режиме headroom
+  # разводит параллельный всплеск по участникам (запас лимита минус запросы в полёте).
+  # auto (зарезервировано, группу с таким именем не задаём) — любой включённый провайдер со своей моделью.
+  # 404/401/403/402 участника — cooldown и следующий в группе; 429 — пауза по Retry-After и тоже следующий,
+  # клиенту 429 только если 429 ответила вся группа.
+  # Участнику уходит ровно его model: без списка fallback-моделей. У OpenRouter ещё
+  # provider.allow_fallbacks=false и без route=fallback. Если в ответе model другая
+  # (nemotron, laguna, flint) или стрим начался не с JSON — попытка сбойная, берём следующего.
+  # Таймаут участника держите заметно ниже клиентского (по умолчанию 30s при клиенте ~120s).
+  model-groups:
+    - name: gpt-oss-120b
+      aliases:
+        - openai/gpt-oss-120b
+      members:
+        - provider: groq
+          model: openai/gpt-oss-120b
+        - provider: ovh
+          model: gpt-oss-120b
+        - provider: sambanova
+          model: gpt-oss-120b
+        # Платный id. :free отвечает 404 «This model is unavailable for free» и в группу не годится.
+        # allow_fallbacks=false на этом вызове не даёт OpenRouter подменить модель.
+        # 404 «unavailable» / «No endpoints found» — участник выключается в группе на model-unavailable-cooldown.
+        - provider: openrouter
+          model: openai/gpt-oss-120b
 
   # Дашборд «Эффективность» (/efficiency.html, GET /stats/efficiency): откуда брать итоги прогонов ai-runner.
   # Необязательно: если spring-runner не запущен, страница покажет только данные шлюза. Пусто — не спрашивать.

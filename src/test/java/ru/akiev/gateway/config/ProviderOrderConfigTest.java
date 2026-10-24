@@ -12,6 +12,7 @@ import org.springframework.boot.context.properties.bind.Binder;
 import org.springframework.boot.context.properties.bind.PropertySourcesPlaceholdersResolver;
 import org.springframework.boot.context.properties.source.ConfigurationPropertySources;
 import org.springframework.boot.env.YamlPropertySourceLoader;
+import org.springframework.core.env.MapPropertySource;
 import org.springframework.core.env.StandardEnvironment;
 import org.springframework.core.io.ClassPathResource;
 import org.yaml.snakeyaml.Yaml;
@@ -116,6 +117,22 @@ class ProviderOrderConfigTest {
         assertThat(provider(g, "groq").extraBody()).isEmpty();
         assertThat(provider(g, "sambanova").extraBody()).isEmpty();
         assertThat(provider(g, "openrouter").extraBody()).isEmpty();
-        assertThat(provider(g, "sambanova").timeout()).isEqualTo(Duration.ofSeconds(120));
+        // Участники gpt-oss-120b: короче клиентского таймаута (~120 с), чтобы failover успел.
+        assertThat(provider(g, "groq").timeout()).isEqualTo(Duration.ofSeconds(30));
+        assertThat(provider(g, "openrouter").timeout()).isEqualTo(Duration.ofSeconds(30));
+        assertThat(provider(g, "sambanova").timeout()).isEqualTo(Duration.ofSeconds(30));
+    }
+
+    @Test
+    void omittedProviderTimeoutDefaultsTo30s() {
+        var env = new StandardEnvironment();
+        env.getPropertySources().addFirst(new MapPropertySource("t", Map.of(
+                "gateway.providers[0].name", "sambanova",
+                "gateway.providers[0].base-url", "https://api.sambanova.ai/v1",
+                "gateway.providers[0].model", "gpt-oss-120b")));
+        GatewayProperties g = new Binder(ConfigurationPropertySources.get(env),
+                new PropertySourcesPlaceholdersResolver(env))
+                .bind("gateway", GatewayProperties.class).get();
+        assertThat(g.providers().get(0).timeout()).isEqualTo(Duration.ofSeconds(30));
     }
 }
