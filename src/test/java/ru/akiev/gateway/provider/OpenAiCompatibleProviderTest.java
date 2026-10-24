@@ -75,6 +75,22 @@ class OpenAiCompatibleProviderTest {
     }
 
     @Test
+    void listedModelIsSentAsIs() throws Exception {
+        server.enqueue(new MockResponse().setHeader("Content-Type", "application/json").setBody(OPENAI_RESPONSE));
+        var props = new ProviderProperties("openrouter", server.url("/v1").toString(), "test-key",
+                "nvidia/nemotron-3-super-120b-a12b:free", 1, Duration.ofSeconds(5), null, true, "/models", null)
+                .withExtraModels(List.of("openai/gpt-oss-120b:free"));
+        var req = new ChatRequest("openai/gpt-oss-120b:free", List.of(new Message("user", "hi")), false,
+                null, null, 10, null, null, null, null);
+
+        new OpenAiCompatibleProvider(WebClient.builder(), props).chat(req);
+
+        String body = server.takeRequest(1, TimeUnit.SECONDS).getBody().readUtf8();
+        assertThat(body).contains("\"model\":\"openai/gpt-oss-120b:free\"")
+                .doesNotContain("nemotron");
+    }
+
+    @Test
     void httpErrorBecomesProviderException() {
         server.enqueue(new MockResponse().setResponseCode(429).setBody("{\"error\":{\"message\":\"rate\"}}"));
         assertThatThrownBy(() -> provider(Duration.ofSeconds(5)).chat(request()))

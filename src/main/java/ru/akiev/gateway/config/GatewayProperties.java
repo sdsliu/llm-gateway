@@ -5,6 +5,7 @@ import jakarta.validation.constraints.NotEmpty;
 import java.time.Duration;
 import java.util.List;
 import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.context.properties.bind.ConstructorBinding;
 import org.springframework.boot.context.properties.bind.DefaultValue;
 import org.springframework.validation.annotation.Validated;
 
@@ -17,5 +18,16 @@ import org.springframework.validation.annotation.Validated;
 @ConfigurationProperties(prefix = "gateway")
 public record GatewayProperties(
         @NotEmpty @Valid List<ProviderProperties> providers,
-        @DefaultValue("5m") Duration defaultCooldown) {
+        @DefaultValue("5m") Duration defaultCooldown,
+        @Valid List<ModelGroupProperties> modelGroups) {
+
+    @ConstructorBinding
+    public GatewayProperties {
+        modelGroups = modelGroups == null ? List.of() : List.copyOf(modelGroups);
+    }
+
+    /** Конструктор для тестов и кода, написанного до групп моделей. */
+    public GatewayProperties(List<ProviderProperties> providers, Duration defaultCooldown) {
+        this(providers, defaultCooldown, List.of());
+    }
 }

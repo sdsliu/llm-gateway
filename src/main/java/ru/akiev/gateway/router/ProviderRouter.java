@@ -8,13 +8,17 @@ import java.util.Comparator;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Stream;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import ru.akiev.gateway.dto.ChatRequest;
 import ru.akiev.gateway.config.LimitsProperties;
+import ru.akiev.gateway.config.ModelGroups;
 import ru.akiev.gateway.dto.ChatResponse;
 import ru.akiev.gateway.limits.RequestEstimator;
 import ru.akiev.gateway.limits.TokenBudget;
@@ -34,6 +38,9 @@ import ru.akiev.gateway.usage.RequestTags;
  *   <li>Пробуем провайдера. Успех — возвращаем ответ.</li>
  *   <li>429 / 5xx / таймаут / сеть — ставим cooldown (Retry-After или 5 минут по умолчанию)
  *       и идём к следующему (failover).</li>
+ *   <li>Внутри группы моделей (и для модели {@code auto}) 404/401/403/402 — тоже failover:
+ *       провайдер уходит в cooldown, пробуем следующего участника. Вне группы обычный 404
+ *       по-прежнему отдаётся клиенту (ошибка конкретного запроса, а не «этот провайдер мёртв»).</li>
  *   <li>Прочие 4xx (например 400 — кривой запрос) отдаём клиенту сразу: другой провайдер
  *       ответит так же.</li>
  *   <li>Никого не осталось — {@link AllProvidersUnavailableException} → HTTP 503.</li>
@@ -54,9 +61,12 @@ import ru.akiev.gateway.usage.RequestTags;
  *   <li>Запрос больше TPM всех провайдеров — сразу 413 request_too_large (ждать бесполезно).</li>
  *   <li>Места нет ни у кого сейчас — ждём до gateway.limits.max-wait (поток Tomcat спит: у нас Spring MVC,
  *       «один запрос = один поток»), потом 429 rate_limit_exceeded с Retry-After.</li>
- *   <li>429 от провайдера — пауза ({@link ProviderState#pauseAfter429}) и failover; паузу досрочно снимает
- *       первый успешный ping LimitDiscoveryService.</li>
+ *   <li>429 от провайдера — пауза ({@link ProviderState#pauseAfter429}) и failover внутри группы,
+ *       прежде чем клиент получит 429; паузу досрочно снимает первый успешный ping LimitDiscoveryService.
+ *       Retry-After этого провайдера соблюдается (cooldown до него).</li>
  *   <li>pin-model-per-run — запросы с одним x-run-id идут к одному провайдеру, пока он доступен.</li>
+ *   <li>HEADROOM вычитает число запросов в полёте: параллельный всплеск расходится по участникам группы,
+ *       а не упирается в один и тот же запас лимита. {@code maxConcurrency} провайдера — жёсткий потолок.</li>
  * </ul>
  */
 public class ProviderRouter {
@@ -77,6 +87,9 @@ public class ProviderRouter {
     private final RunPins pins;
     /** Выбор + резерв токенов под одним замком: два параллельных запроса не займут один и тот же остаток. */
     private final Object selectLock = new Object();
+    private final ModelGroups groups;
+    /** Запросы, которые уже выбраны, но ещё не завершились. Учитывается в счёте HEADROOM и в maxConcurrency. */
+    private final ConcurrentHashMap<String, AtomicInteger> inFlight = new ConcurrentHashMap<>();
 
     /** Как ждать освобождения лимита. В проде — Thread.sleep, в тестах — «перемотка» фейковых часов. */
     @FunctionalInterface
@@ -97,6 +110,11 @@ public class ProviderRouter {
 
     public ProviderRouter(List<LlmProvider> providers, Duration defaultCooldown, Clock clock,
             RouterListener listener, LimitsProperties limits, Sleeper sleeper) {
+        this(providers, defaultCooldown, clock, listener, limits, sleeper, ModelGroups.EMPTY);
+    }
+
+    public ProviderRouter(List<LlmProvider> providers, Duration defaultCooldown, Clock clock,
+            RouterListener listener, LimitsProperties limits, Sleeper sleeper, ModelGroups groups) {
         this.listener = listener;
         this.providers = providers.stream().sorted(Comparator.comparingInt(LlmProvider::priority)).toList();
         this.defaultCooldown = defaultCooldown != null ? defaultCooldown : Duration.ofMinutes(5);
@@ -105,6 +123,12 @@ public class ProviderRouter {
         this.estimator = new RequestEstimator(this.limits.defaultMaxTokens());
         this.sleeper = sleeper != null ? sleeper : Sleeper.THREAD;
         this.pins = new RunPins(this.limits.pinTtl());
+        this.groups = groups != null ? groups : ModelGroups.EMPTY;
+    }
+
+    /** Имена и алиасы групп моделей для /v1/models. */
+    public List<String> logicalModels() {
+        return groups.advertised();
     }
 
     public LimitsProperties limitsSettings() {
@@ -186,14 +210,31 @@ public class ProviderRouter {
     // Выбор провайдера по лимитам
     // ---------------------------------------------------------------------------------------------
 
-    /** Выбранный провайдер и резерв токенов под запрос. */
-    record Selection(LlmProvider provider, TokenBudget.Reservation reservation) {
+    /** Выбранный провайдер и резерв токенов под запрос. Слот in-flight отпускается один раз. */
+    private static final class Selection {
+        final LlmProvider provider;
+        final TokenBudget.Reservation reservation;
+        final AtomicBoolean held = new AtomicBoolean(true);
+
+        Selection(LlmProvider provider, TokenBudget.Reservation reservation) {
+            this.provider = provider;
+            this.reservation = reservation;
+        }
+
+        LlmProvider provider() {
+            return provider;
+        }
+
+        TokenBudget.Reservation reservation() {
+            return reservation;
+        }
     }
 
     /** Состояние перебора одного клиентского запроса. */
     private final class Attempt {
         final ChatRequest request;
         final long tokens;
+        final ModelGroups.Resolution resolution;
         final List<LlmProvider> ordered = order(true);
         final Set<LlmProvider> tried = new HashSet<>();
         final List<String> failures = new ArrayList<>();
@@ -201,20 +242,42 @@ public class ProviderRouter {
         final String runId = RequestTags.current().runId();
         final Instant deadline;
         int attempted;
+        /** Сколько провайдеров ответили 429 в этом запросе (для итогового 429 клиенту). */
+        int rateLimitHits;
+        /** Ошибки failover, которые не 429 (5xx, 404 в группе и т.п.). */
+        int otherFailures;
+        /** Самый короткий Retry-After среди 429 этого запроса. */
+        Duration soonestRetry;
         /** Ближайший момент освобождения среди провайдеров, упёршихся в лимит (для Retry-After). */
         Instant limitRetryAt;
         boolean limitBlocked;
+        boolean concurrencyBlocked;
 
         Attempt(ChatRequest request) {
             this.request = request;
             this.tokens = estimator.estimate(request).total();
             this.deadline = clock.instant().plus(limits.maxWait());
+            this.resolution = groups.resolve(request == null ? null : request.model());
         }
 
-        /** Провайдеры, у которых есть запрошенная модель; если её нет ни у кого — все (как до #34). */
+        boolean spread() {
+            return resolution.spreadsFailover();
+        }
+
+        /**
+         * Кандидаты: участники группы моделей, все провайдеры для {@code auto} и пустой модели,
+         * иначе провайдеры с точным id. Если точного id нет ни у кого — все (как до #34).
+         */
         List<LlmProvider> modelCandidates() {
+            if (resolution.kind() == ModelGroups.Kind.GROUP) {
+                Set<String> names = groups.providerNames(resolution.group());
+                return ordered.stream().filter(p -> names.contains(p.name())).toList();
+            }
+            if (resolution.kind() == ModelGroups.Kind.AUTO) {
+                return ordered;
+            }
             String model = request.model();
-            List<LlmProvider> withModel = model == null ? List.of()
+            List<LlmProvider> withModel = model == null || model.isBlank() ? List.of()
                     : ordered.stream().filter(p -> p.models().contains(model)).toList();
             return withModel.isEmpty() ? ordered : withModel;
         }
@@ -258,10 +321,12 @@ public class ProviderRouter {
                 LlmProvider pinnedProvider = pinned == null ? null
                         : candidates.stream().filter(p -> p.name().equals(pinned)).findFirst().orElse(null);
                 LlmProvider best = null;
-                double bestHeadroom = Double.NEGATIVE_INFINITY;
+                double bestScore = Double.NEGATIVE_INFINITY;
                 boolean pinnedWaitable = false;
+                boolean pinnedAtMax = false;
                 a.limitBlocked = false;
                 a.limitRetryAt = null;
+                a.concurrencyBlocked = false;
                 for (LlmProvider p : candidates) {
                     ProviderState.Capacity c = p.state().capacity(now, a.tokens);
                     if (!c.fits()) {
@@ -279,19 +344,31 @@ public class ProviderRouter {
                         log.debug("Пропускаем {}: {} (до {})", p.name(), c.blockedBy(), c.retryAt());
                         continue;
                     }
+                    int flying = inFlight(p);
+                    Integer max = p.maxConcurrency();
+                    if (max != null && max > 0 && flying >= max) {
+                        a.concurrencyBlocked = true;
+                        if (p == pinnedProvider) {
+                            pinnedAtMax = true;
+                        }
+                        log.debug("Пропускаем {}: max concurrency {}/{}", p.name(), flying, max);
+                        continue;
+                    }
                     if (pinnedProvider != null && p != pinnedProvider) {
                         continue; // run привязан к другому провайдеру — этот пока не рассматриваем
                     }
-                    // HEADROOM — максимум запаса; остальные режимы — первый подходящий в порядке order().
-                    if (routing.mode() == RoutingMode.HEADROOM ? c.headroom() > bestHeadroom : best == null) {
+                    // HEADROOM — запас минус запросы в полёте, чтобы параллельный всплеск разошёлся
+                    // по разным провайдерам. Остальные режимы — первый подходящий в порядке order().
+                    double score = c.headroom() - flying;
+                    if (routing.mode() == RoutingMode.HEADROOM ? score > bestScore : best == null) {
                         best = p;
-                        bestHeadroom = c.headroom();
+                        bestScore = score;
                     }
                 }
                 if (best != null) {
                     return reserve(a, best, now, pinned);
                 }
-                if (pinnedProvider != null && !pinnedWaitable) {
+                if (pinnedProvider != null && !pinnedWaitable && !pinnedAtMax) {
                     // Привязанный провайдер недоступен надолго (cooldown/исключён/сутки) — снимаем привязку.
                     if (!pinFallbackLogged) {
                         log.warn("x-run-id {}: привязанный провайдер {} недоступен — переключаемся на другого",
@@ -305,7 +382,7 @@ public class ProviderRouter {
             if (wakeAt == null) {
                 for (LlmProvider p : a.modelCandidates()) {
                     if (!a.tried.contains(p)) {
-                        a.failures.add(p.name() + ": " + describe(p.state().capacity(now, a.tokens)));
+                        a.failures.add(p.name() + ": " + describeSkip(p, now, a.tokens));
                     }
                 }
                 return null;
@@ -334,7 +411,58 @@ public class ProviderRouter {
             }
         }
         a.tried.add(p);
+        acquire(p);
         return new Selection(p, r);
+    }
+
+    private int inFlight(LlmProvider p) {
+        AtomicInteger n = inFlight.get(p.name());
+        return n == null ? 0 : Math.max(0, n.get());
+    }
+
+    private void acquire(LlmProvider p) {
+        inFlight.computeIfAbsent(p.name(), k -> new AtomicInteger()).incrementAndGet();
+    }
+
+    private void release(LlmProvider p) {
+        AtomicInteger n = inFlight.get(p.name());
+        if (n != null) {
+            n.updateAndGet(v -> Math.max(0, v - 1));
+        }
+    }
+
+    private void releaseSelection(Selection s) {
+        if (s.held.compareAndSet(true, false)) {
+            release(s.provider);
+        }
+    }
+
+    /** Тело запроса с model id конкретного провайдера (группа или auto). */
+    private ChatRequest forProvider(Attempt a, LlmProvider p) {
+        ChatRequest request = a.request;
+        if (a.resolution.kind() == ModelGroups.Kind.GROUP) {
+            String model = groups.modelFor(a.resolution.group(), p.name());
+            if (model != null && !model.isBlank()) {
+                return request.withModel(model);
+            }
+            return request;
+        }
+        if (a.resolution.kind() == ModelGroups.Kind.AUTO) {
+            List<String> models = p.models();
+            if (!models.isEmpty()) {
+                return request.withModel(models.get(0));
+            }
+        }
+        return request;
+    }
+
+    private String describeSkip(LlmProvider p, Instant now, long tokens) {
+        Integer max = p.maxConcurrency();
+        int flying = inFlight(p);
+        if (max != null && max > 0 && flying >= max) {
+            return "max concurrency " + flying + "/" + max;
+        }
+        return describe(p.state().capacity(now, tokens));
     }
 
     private static boolean isLimit(String blockedBy) {
@@ -355,10 +483,25 @@ public class ProviderRouter {
         };
     }
 
-    /** Никого не осталось: 413 (всем велик), 429 (упёрлись в лимиты) или 503 (все упали / в паузе). */
+    /** Никого не осталось: 413 (всем велик), 429 (упёрлись в лимиты / вся группа ответила 429) или 503. */
     private RuntimeException exhausted(Attempt a) {
         throwIfAllTooLarge(a.tooLarge, a.attempted);
+        if (a.resolution.kind() == ModelGroups.Kind.GROUP && a.modelCandidates().isEmpty() && a.attempted == 0) {
+            return new AllProvidersUnavailableException("No enabled providers in model group '"
+                    + a.resolution.group().name() + "'");
+        }
         String reasons = a.failures.isEmpty() ? "" : " (" + String.join(", ", a.failures) + ")";
+        // Вся группа ответила 429 — клиенту 429 с самым коротким Retry-After, а не 503.
+        if (a.spread() && a.rateLimitHits > 0 && a.otherFailures == 0) {
+            Duration retry = a.soonestRetry != null ? a.soonestRetry : Duration.ofMinutes(1);
+            log.warn("Лимиты провайдеров группы исчерпаны{} — 429, повторить через {}", reasons, retry);
+            return new RateLimitedException("Rate limit exceeded on all providers" + reasons, retry);
+        }
+        if (a.concurrencyBlocked && !a.limitBlocked) {
+            log.warn("Все подходящие провайдеры заняты (max concurrency){} — 429", reasons);
+            return new RateLimitedException("All eligible providers are at max concurrency" + reasons,
+                    Duration.ofSeconds(1));
+        }
         if (a.limitBlocked) {
             Instant now = clock.instant();
             Duration retry = a.limitRetryAt != null && a.limitRetryAt.isAfter(now)
@@ -382,33 +525,46 @@ public class ProviderRouter {
     }
 
     /**
-     * Общая обработка ошибки попытки: 413 — без паузы; 4xx — наружу без failover; 429 — пауза до первого
-     * успешного ping; прочие (5xx, таймаут) — cooldown. Возвращает нормально, если надо пробовать следующего.
+     * Общая обработка ошибки попытки: 413 — без паузы; обычный 4xx вне группы — наружу без failover;
+     * 404/401/403/402 внутри группы (и для {@code auto}) — cooldown и следующий участник;
+     * 429 — пауза до Retry-After (или до первого успешного ping); прочие (5xx, таймаут) — cooldown.
+     * Возвращает нормально, если надо пробовать следующего.
      */
     private void onAttemptFailure(Attempt a, LlmProvider p, ProviderException e, String what) {
         if (e.isRequestTooLarge()) {
             tooLarge(p, e, a.tooLarge, a.failures);
             return;
         }
-        if (!e.isRetriable()) {
-            // 400/404 и т.п. — не failover, но обязательно в лог (например, OpenRouter 404
-            // «No endpoints found» для снятой :free модели).
+        boolean providerSpecific = isProviderSpecificFailure(e);
+        if (!e.isRetriable() && !(a.spread() && providerSpecific)) {
+            // 400 и обычный 404 вне группы — не failover, но обязательно в лог.
             log.warn("Провайдер {} ответил {} (без failover): {}", p.name(), e.status(), snippet(e.getMessage()));
             throw e;
         }
         Duration cd = e.retryAfter() != null ? e.retryAfter() : defaultCooldown;
         Instant now = clock.instant();
         if (e.status() == 429) {
+            a.rateLimitHits++;
+            if (a.soonestRetry == null || cd.compareTo(a.soonestRetry) < 0) {
+                a.soonestRetry = cd;
+            }
             p.state().pauseAfter429(now, now.plus(cd), "HTTP 429");
             log.warn("{}: {} ответил 429 — пауза до {} или до первого успешного ping, пробуем следующего. {}",
                     what, p.name(), now.plus(cd), snippet(e.getMessage()));
         } else {
+            a.otherFailures++;
             p.state().cooldown(now.plus(cd), "HTTP " + e.status());
-            log.warn("{}: {} ответил {} — cooldown {}, пробуем следующего. {}",
-                    what, p.name(), e.status(), cd, snippet(e.getMessage()));
+            log.warn("{}: {} ответил {} — cooldown {}, пробуем следующего{}. {}",
+                    what, p.name(), e.status(), cd, a.spread() ? " в группе" : "", snippet(e.getMessage()));
         }
         a.attempted++;
         a.failures.add(p.name() + ": HTTP " + e.status());
+    }
+
+    /** 404/401/403/402 — проблема этого провайдера (битый URL, нет модели, нет оплаты, протух ключ). */
+    private static boolean isProviderSpecificFailure(ProviderException e) {
+        int status = e.status();
+        return status == 404 || status == 401 || status == 402 || status == 403;
     }
 
     public ChatResponse chat(ChatRequest request) {
@@ -417,11 +573,12 @@ public class ProviderRouter {
         Selection s;
         while ((s = next(a)) != null) {
             LlmProvider p = s.provider();
-            log.info("Запрос → провайдер {} (priority {}, режим {}, оценка ~{} токенов)",
-                    p.name(), p.priority(), routing.mode(), a.tokens);
+            ChatRequest outgoing = forProvider(a, p);
+            log.info("Запрос → провайдер {} (priority {}, режим {}, модель {}, оценка ~{} токенов, in-flight {})",
+                    p.name(), p.priority(), routing.mode(), outgoing.model(), a.tokens, inFlight(p));
             long start = System.nanoTime();
             try {
-                ChatResponse resp = p.chat(request);
+                ChatResponse resp = p.chat(outgoing);
                 p.state().budget().settle(s.reservation(), usageTokens(resp));
                 listener.onSuccess(p, resp, (System.nanoTime() - start) / 1_000_000);
                 return resp;
@@ -429,6 +586,8 @@ public class ProviderRouter {
                 settleFailure(s, e);
                 listener.onFailure(p, e, (System.nanoTime() - start) / 1_000_000);
                 onAttemptFailure(a, p, e, "Failover");
+            } finally {
+                releaseSelection(s);
             }
         }
         throw exhausted(a);
@@ -460,25 +619,37 @@ public class ProviderRouter {
         rejectIfLargerThanEveryTpm(a);
         Selection s;
         while ((s = next(a)) != null) {
-            LlmProvider p = s.provider();
-            log.info("Стрим → провайдер {} (priority {}, режим {}, оценка ~{} токенов)",
-                    p.name(), p.priority(), routing.mode(), a.tokens);
+            Selection current = s;
+            LlmProvider p = current.provider();
+            ChatRequest outgoing = forProvider(a, p);
+            log.info("Стрим → провайдер {} (priority {}, режим {}, модель {}, оценка ~{} токенов, in-flight {})",
+                    p.name(), p.priority(), routing.mode(), outgoing.model(), a.tokens, inFlight(p));
             long start = System.nanoTime();
-            Stream<String> stream = p.chatStream(request).toStream(STREAM_PREFETCH);
-            Iterator<String> it = stream.iterator();
+            Stream<String> stream = null;
+            boolean handedOff = false;
             try {
+                stream = p.chatStream(outgoing).toStream(STREAM_PREFETCH);
+                Iterator<String> it = stream.iterator();
                 if (!it.hasNext()) {
                     // Провайдер закрыл поток, не прислав ни одного чанка — считаем сбоем.
                     throw new ProviderException(502, "Provider " + p.name() + " returned empty stream", null);
                 }
                 String first = it.next();
-                return new StreamSession(p, stream, it, first, start, request.clientWantsStreamUsage(),
-                        settling(s));
+                StreamSession session = new StreamSession(p, stream, it, first, start,
+                        request.clientWantsStreamUsage(), settling(current), () -> releaseSelection(current));
+                handedOff = true;
+                return session;
             } catch (ProviderException e) {
-                stream.close();
-                settleFailure(s, e);
+                if (stream != null) {
+                    stream.close();
+                }
+                settleFailure(current, e);
                 listener.onFailure(p, e, (System.nanoTime() - start) / 1_000_000);
                 onAttemptFailure(a, p, e, "Failover (стрим, до первого чанка)");
+            } finally {
+                if (!handedOff) {
+                    releaseSelection(current);
+                }
             }
         }
         throw exhausted(a);

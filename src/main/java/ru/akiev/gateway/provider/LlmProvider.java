@@ -28,4 +28,12 @@ public interface LlmProvider {
 
     /** Runtime-состояние: cooldown, остатки лимитов. */
     ProviderState state();
+
+    /**
+     * Сколько запросов может одновременно быть в полёте. {@code null} или неположительное значение — без ограничения.
+     * Роутер не выбирает провайдера, пока заняты все слоты.
+     */
+    default Integer maxConcurrency() {
+        return null;
+    }
 }

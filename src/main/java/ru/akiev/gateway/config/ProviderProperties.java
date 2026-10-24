@@ -35,11 +35,14 @@ import org.springframework.http.HttpHeaders;
  *                    заголовка Authorization. Ключ, если задан, отправляется как обычно (выше лимиты).
  * @param models      дополнительные модели, которые провайдер обслуживает (кроме {@code model}). Если клиент
  *                    прислал одну из них — уходит она, иначе — {@code model} (как раньше). Роутер выбирает только
- *                    среди провайдеров, у которых запрошенная модель есть (если её нет ни у кого — среди всех).
+ *                    среди провайдеров, у которых запрошенная модель есть (если её нет ни у кого — среди всех),
+ *                    либо среди участников группы моделей (см. {@code gateway.model-groups}).
  * @param limitsProbe как узнавать лимиты у провайдера: auto (по base-url), groq (заголовки крошечного запроса),
  *                    openrouter (GET /key), gonka (GET /test-auth → maxRpm), models (GET ping-path, заголовки ответа),
  *                    none (не опрашивать: провайдер всегда в ротации, лимиты из конфига)
  * @param limitsProbeUrl полный URL для опроса лимитов, если он не {base-url}/key или {base-url}/test-auth
+ * @param maxConcurrency сколько запросов может быть в полёте одновременно. null или неположительное — без ограничения.
+ *                    Сверх лимита провайдер пропускается, всплеск уходит к остальным.
  */
 public record ProviderProperties(
         @NotBlank String name,
@@ -56,7 +59,8 @@ public record ProviderProperties(
         @DefaultValue("false") boolean apiKeyOptional,
         List<String> models,
         @DefaultValue("auto") String limitsProbe,
-        String limitsProbeUrl) {
+        String limitsProbeUrl,
+        Integer maxConcurrency) {
 
     /** Канонический конструктор — по нему Spring Boot биндит application.yml (их у record теперь два). */
     @ConstructorBinding
@@ -86,7 +90,16 @@ public record ProviderProperties(
             Duration timeout, Limits limits, boolean streamUsage, String pingPath, List<String> fallbackModels,
             Map<String, Object> extraBody, boolean apiKeyOptional) {
         this(name, baseUrl, apiKey, model, priority, timeout, limits, streamUsage, pingPath, fallbackModels,
-                extraBody, apiKeyOptional, null, "auto", null);
+                extraBody, apiKeyOptional, null, "auto", null, null);
+    }
+
+    /** Без max-concurrency (код и тесты до распределения in-flight). */
+    public ProviderProperties(String name, String baseUrl, String apiKey, String model, int priority,
+            Duration timeout, Limits limits, boolean streamUsage, String pingPath, List<String> fallbackModels,
+            Map<String, Object> extraBody, boolean apiKeyOptional, List<String> models, String limitsProbe,
+            String limitsProbeUrl) {
+        this(name, baseUrl, apiKey, model, priority, timeout, limits, streamUsage, pingPath, fallbackModels,
+                extraBody, apiKeyOptional, models, limitsProbe, limitsProbeUrl, null);
     }
 
     /**
@@ -138,5 +151,80 @@ public record ProviderProperties(
         if (hasApiKey()) {
             headers.setBearerAuth(apiKey.trim());
         }
+    }
+
+    /**
+     * Почему провайдера нельзя включать. {@code null} — конфиг годный.
+     * Пустой ключ (и он обязателен) или битый {@code base-url}: пустой сегмент пути
+     * (не задан {@code CLOUDFLARE_ACCOUNT_ID} → {@code /accounts//ai/v1}), нет схемы/хоста,
+     * нераскрытый placeholder.
+     */
+    public String disabledReason() {
+        if (!enabled()) {
+            return "api-key не задан";
+        }
+        String url = baseUrlProblem(baseUrl);
+        if (url != null) {
+            return url;
+        }
+        if (model == null || model.isBlank()) {
+            return "model пустой";
+        }
+        return null;
+    }
+
+    /** Можно создать клиента и слать запросы: есть ключ (или он необязателен) и base-url разбирается. */
+    public boolean usable() {
+        return disabledReason() == null;
+    }
+
+    /**
+     * Копия с дополнительными id моделей (участник группы шлёт свой model id, а не model по умолчанию).
+     * Уже известные id не дублируются.
+     */
+    public ProviderProperties withExtraModels(List<String> extra) {
+        if (extra == null || extra.isEmpty()) {
+            return this;
+        }
+        java.util.LinkedHashSet<String> merged = new java.util.LinkedHashSet<>(models);
+        for (String m : extra) {
+            if (m != null && !m.isBlank() && !m.equals(model)) {
+                merged.add(m);
+            }
+        }
+        if (merged.size() == models.size()) {
+            return this;
+        }
+        return new ProviderProperties(name, baseUrl, apiKey, model, priority, timeout, limits, streamUsage, pingPath,
+                fallbackModels, extraBody, apiKeyOptional, List.copyOf(merged), limitsProbe, limitsProbeUrl,
+                maxConcurrency);
+    }
+
+    static String baseUrlProblem(String baseUrl) {
+        if (baseUrl == null || baseUrl.isBlank()) {
+            return "base-url пустой";
+        }
+        String trimmed = baseUrl.trim();
+        if (trimmed.contains("${")) {
+            return "base-url содержит нераскрытый placeholder: " + trimmed;
+        }
+        java.net.URI uri;
+        try {
+            uri = java.net.URI.create(trimmed);
+        } catch (IllegalArgumentException e) {
+            return "base-url не является корректным URL: " + trimmed;
+        }
+        String scheme = uri.getScheme();
+        if (scheme == null || !(scheme.equalsIgnoreCase("http") || scheme.equalsIgnoreCase("https"))) {
+            return "base-url без схемы http(s): " + trimmed;
+        }
+        if (uri.getHost() == null || uri.getHost().isBlank()) {
+            return "base-url без хоста: " + trimmed;
+        }
+        String path = uri.getRawPath();
+        if (path != null && path.contains("//")) {
+            return "base-url с пустым сегментом пути (не задана переменная, например account id): " + trimmed;
+        }
+        return null;
     }
 }

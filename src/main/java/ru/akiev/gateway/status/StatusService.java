@@ -106,8 +106,9 @@ public class StatusService {
         // Провайдеры без ключа тоже показываем — со статусом skipped.
         for (ProviderProperties pp : props.providers()) {
             if (!enabled.contains(pp.name())) {
+                String why = pp.disabledReason() != null ? pp.disabledReason() : "api-key не задан";
                 providers.add(new ProviderStatus(pp.name(), pp.model(), pp.priority(), "skipped",
-                        null, "api-key не задан", null, null, null,
+                        null, why, null, null, null,
                         pp.limits() != null ? pp.limits().rpm() : null, null,
                         pp.limits() != null ? pp.limits().rpd() : null,
                         0, 0, 0, null, null, null, null, null, null, null, null, false,
@@ -154,8 +155,9 @@ public class StatusService {
         }
         for (ProviderProperties pp : props.providers()) {
             if (!enabled.contains(pp.name())) {
-                options.add(new RoutingInfo.ProviderOption(pp.name(), pp.priority(), false, "no_key", null,
-                        "api-key не задан", false));
+                String why = pp.disabledReason() != null ? pp.disabledReason() : "api-key не задан";
+                options.add(new RoutingInfo.ProviderOption(pp.name(), pp.priority(), false,
+                        pp.enabled() ? "invalid" : "no_key", null, why, false));
             }
         }
         options.sort((a, b) -> Integer.compare(a.priority(), b.priority()));

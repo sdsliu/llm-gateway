@@ -86,15 +86,31 @@ public class OpenAiCompatibleProvider implements LlmProvider {
     }
 
     @Override
+    public Integer maxConcurrency() {
+        return props.maxConcurrency();
+    }
+
+    /**
+     * Модель из конфигурации ({@code model} или список {@code models}, включая id из группы) уходит как есть.
+     * Любое другое имя клиента (и пустое) заменяется на основную модель провайдера.
+     */
+    private ChatRequest applyConfiguredModel(ChatRequest request) {
+        if (props.model() == null || props.model().isBlank()) {
+            return request;
+        }
+        String requested = request.model();
+        if (requested != null && props.allModels().contains(requested)) {
+            return request;
+        }
+        return request.withModel(props.model());
+    }
+
+    @Override
     public ChatResponse chat(ChatRequest request) {
         // Override модели: клиент может прислать любое имя (например "openai/coder" от Aider),
-        // а провайдеру уходит реальная модель из конфигурации.
-        ChatRequest outgoing = request.withoutStream();
-        if (props.model() != null && !props.model().isBlank()
-                && (request.model() == null || !props.models().contains(request.model()))) {
-            // Модель из списка models уходит как есть, всё остальное заменяем на основную модель провайдера.
-            outgoing = outgoing.withModel(props.model());
-        }
+        // а провайдеру уходит реальная модель из конфигурации — либо id, который роутер уже
+        // подставил из группы моделей.
+        ChatRequest outgoing = applyConfiguredModel(request.withoutStream());
         state.recordRequest(clock.instant());
 
         try {
@@ -172,13 +188,7 @@ public class OpenAiCompatibleProvider implements LlmProvider {
      */
     @Override
     public Flux<String> chatStream(ChatRequest request) {
-        ChatRequest outgoing = request.withStream(props.streamUsage());
-        if (props.model() != null && !props.model().isBlank()
-                && (request.model() == null || !props.models().contains(request.model()))) {
-            // Модель из списка models уходит как есть, всё остальное заменяем на основную модель провайдера.
-            outgoing = outgoing.withModel(props.model());
-        }
-        ChatRequest body = outgoing;
+        ChatRequest body = applyConfiguredModel(request).withStream(props.streamUsage());
         // Flux.defer — ничего не делаем до подписки (в том числе не считаем запрос в лимитах).
         return Flux.defer(() -> {
             state.recordRequest(clock.instant());
