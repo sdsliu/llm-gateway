@@ -24,7 +24,12 @@ spring:
 
 gateway:
   # Пауза для провайдера после 429/5xx/таймаута, если он не прислал Retry-After
+  # (и если Retry-After: 0 — иначе провайдер выбирался бы на каждый следующий запрос).
+  # Успешный ping эту паузу не снимает раньше срока: GET /models может быть 200, пока chat в лимите.
   default-cooldown: 5m
+  # 404 «model unavailable» / «No endpoints found» у участника группы: не звать его в этой группе.
+  # Ping провайдера паузу не снимает.
+  model-unavailable-cooldown: 10m
   # Режим выбора провайдера по умолчанию. С дашборда / PUT /status/routing меняется и сохраняется в БД
   # (таблица routing_settings) — переживает рестарт и имеет приоритет над этим блоком.
   # «Сбросить к настройкам из конфига» (DELETE /status/routing) удаляет сохранённое — снова действует этот блок.
@@ -226,10 +231,11 @@ gateway:
           model: gpt-oss-120b
         - provider: sambanova
           model: gpt-oss-120b
-        # OpenRouter: бесплатный вариант. Платный id — openai/gpt-oss-120b (без :free).
-        # 404 «No endpoints found» (privacy / модель снята) — failover на остальных участников.
+        # Платный id. :free отвечает 404 «This model is unavailable for free» и в группу не годится.
+        # allow_fallbacks=false на этом вызове не даёт OpenRouter подменить модель.
+        # 404 «unavailable» / «No endpoints found» — участник выключается в группе на model-unavailable-cooldown.
         - provider: openrouter
-          model: openai/gpt-oss-120b:free
+          model: openai/gpt-oss-120b
 
   # Дашборд «Эффективность» (/efficiency.html, GET /stats/efficiency): откуда брать итоги прогонов ai-runner.
   # Необязательно: если spring-runner не запущен, страница покажет только данные шлюза. Пусто — не спрашивать.

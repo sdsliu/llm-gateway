@@ -91,6 +91,27 @@ class OpenAiCompatibleProviderTest {
     }
 
     @Test
+    void zeroRetryAfterFallsThroughToResetHeader() {
+        server.enqueue(new MockResponse().setResponseCode(429)
+                .setHeader("Retry-After", "0")
+                .setHeader("x-ratelimit-reset-requests", "45s")
+                .setBody("{\"error\":{\"message\":\"rate\"}}"));
+        assertThatThrownBy(() -> provider(Duration.ofSeconds(5)).chat(request()))
+                .isInstanceOf(ProviderException.class)
+                .satisfies(e -> assertThat(((ProviderException) e).retryAfter()).isEqualTo(Duration.ofSeconds(45)));
+    }
+
+    @Test
+    void resetHeaderIsUsedWhenRetryAfterIsMissing() {
+        server.enqueue(new MockResponse().setResponseCode(429)
+                .setHeader("x-ratelimit-reset-requests", "30s")
+                .setBody("{\"error\":{\"message\":\"rate\"}}"));
+        assertThatThrownBy(() -> provider(Duration.ofSeconds(5)).chat(request()))
+                .isInstanceOf(ProviderException.class)
+                .satisfies(e -> assertThat(((ProviderException) e).retryAfter()).isEqualTo(Duration.ofSeconds(30)));
+    }
+
+    @Test
     void httpErrorBecomesProviderException() {
         server.enqueue(new MockResponse().setResponseCode(429).setBody("{\"error\":{\"message\":\"rate\"}}"));
         assertThatThrownBy(() -> provider(Duration.ofSeconds(5)).chat(request()))

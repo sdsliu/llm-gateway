@@ -126,7 +126,7 @@ public class ProviderState {
 
     /**
      * Пауза после 429: обычный cooldown (до Retry-After или default-cooldown) плюс отметка, что пауза
-     * «от 429» — такую LimitDiscoveryService снимает досрочно после первого успешного ping.
+     * «от 429». Успешный ping её не снимает раньше {@code until}: GET /models может быть 200, пока chat в лимите.
      */
     public synchronized void pauseAfter429(Instant now, Instant until, String reason) {
         cooldown(until, reason);
@@ -204,7 +204,7 @@ public class ProviderState {
         cooldownReason = reason;
     }
 
-    /** Снять cooldown вручную (тесты, будущая админка) или после успешного ping. */
+    /** Снять cooldown вручную (тесты, админка). Успешный ping паузу после 429 не снимает. */
     public synchronized void resetCooldown() {
         cooldownUntil = Instant.EPOCH;
         cooldownReason = null;

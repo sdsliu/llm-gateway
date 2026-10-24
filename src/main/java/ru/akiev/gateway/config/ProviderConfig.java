@@ -58,7 +58,7 @@ public class ProviderConfig {
             log.warn("Нет ни одного включённого провайдера — все запросы будут получать 503");
         }
         ProviderRouter router = new ProviderRouter(providers, props.defaultCooldown(), clock, usageService,
-                limits, ProviderRouter.Sleeper.THREAD, groups);
+                limits, ProviderRouter.Sleeper.THREAD, groups, props.modelUnavailableCooldown());
         router.setRouting(initialRouting(props, routing, router));
         log.info("Режим роутинга при старте: {}", router.routing());
         return router;

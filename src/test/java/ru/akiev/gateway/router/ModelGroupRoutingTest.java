@@ -6,6 +6,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -136,7 +137,7 @@ class ModelGroupRoutingTest {
                 new Member("groq", "openai/gpt-oss-120b"),
                 new Member("ovh", "gpt-oss-120b"),
                 new Member("sambanova", "gpt-oss-120b"),
-                new Member("openrouter", "openai/gpt-oss-120b:free")));
+                new Member("openrouter", "openai/gpt-oss-120b")));
     }
 
     static ModelGroups groups(String... enabled) {
@@ -161,7 +162,7 @@ class ModelGroupRoutingTest {
         assertThat(groups.modelFor(groups.resolve("gpt-oss-120b").group(), "groq")).isEqualTo("openai/gpt-oss-120b");
         assertThat(groups.modelFor(groups.resolve("gpt-oss-120b").group(), "ovh")).isEqualTo("gpt-oss-120b");
         assertThat(groups.modelFor(groups.resolve("gpt-oss-120b").group(), "openrouter"))
-                .isEqualTo("openai/gpt-oss-120b:free");
+                .isEqualTo("openai/gpt-oss-120b");
         assertThat(groups.advertised()).contains("gpt-oss-120b", "openai/gpt-oss-120b");
 
         Fake groq = new Fake("groq", 1, "openai/gpt-oss-120b");
@@ -221,7 +222,7 @@ class ModelGroupRoutingTest {
                     "groq", "openai/gpt-oss-120b",
                     "ovh", "gpt-oss-120b",
                     "sambanova", "gpt-oss-120b",
-                    "openrouter", "openai/gpt-oss-120b:free");
+                    "openrouter", "openai/gpt-oss-120b");
             for (Fake f : List.of(groq, ovh, samba, routerOr)) {
                 if (f.calls.get() > 0) {
                     assertThat(f.seenModels).containsOnly(expected.get(f.name));
@@ -397,7 +398,7 @@ class ModelGroupRoutingTest {
                     new RoutingProperties(RoutingMode.PRIORITY, null), LimitsProperties.LEGACY);
             assertThat(r.names()).contains("groq", "ovh", "openrouter");
             assertThat(r.providers().stream().filter(p -> p.name().equals("openrouter")).findFirst().orElseThrow().models())
-                    .contains("openai/gpt-oss-120b:free", "nvidia/nemotron-3-super-120b-a12b:free");
+                    .contains("openai/gpt-oss-120b", "nvidia/nemotron-3-super-120b-a12b:free");
 
             assertThat(r.chat(request("gpt-oss-120b")).choices().get(0).message().content()).isEqualTo("from-ovh");
             String groqBody = groq.takeRequest(1, TimeUnit.SECONDS).getBody().readUtf8();
@@ -422,13 +423,13 @@ class ModelGroupRoutingTest {
         assertThat(r.chat(request("gpt-oss-120b")).id()).isEqualTo("ovh");
         assertThat(openrouter.exactModel).isTrue();
         assertThat(ovh.exactModel).isTrue();
-        assertThat(openrouter.seenModels).containsExactly("openai/gpt-oss-120b:free");
+        assertThat(openrouter.seenModels).containsExactly("openai/gpt-oss-120b");
         assertThat(openrouter.state().cooldownReason()).isEqualTo("HTTP 502");
         assertThat(openrouter.state().isAvailable(clock.instant())).isFalse();
 
         // :free и базовый id — одна модель, failover не нужен
         openrouter.state().resetCooldown();
-        openrouter.servedModel = "openai/gpt-oss-120b";
+        openrouter.servedModel = "openai/gpt-oss-120b:free";
         openrouter.calls.set(0);
         ovh.calls.set(0);
         assertThat(r.chat(request("gpt-oss-120b")).id()).isEqualTo("openrouter");
@@ -495,7 +496,8 @@ class ModelGroupRoutingTest {
 
             assertThat(r.chat(request("gpt-oss-120b")).choices().get(0).message().content()).isEqualTo("from-ovh");
             String orBody = openrouter.takeRequest(1, TimeUnit.SECONDS).getBody().readUtf8();
-            assertThat(orBody).contains("\"model\":\"openai/gpt-oss-120b:free\"")
+            assertThat(orBody).contains("\"model\":\"openai/gpt-oss-120b\"")
+                    .doesNotContain(":free")
                     .contains("\"allow_fallbacks\":false")
                     .contains("DeepInfra")
                     .doesNotContain("\"models\"")
@@ -548,6 +550,109 @@ class ModelGroupRoutingTest {
         } finally {
             samba.shutdown();
             ovh.shutdown();
+        }
+    }
+
+    @Test
+    void modelUnavailable404SkipsMemberForTheGroupEvenAfterProviderCooldownReset() {
+        Fake openrouter = new Fake("openrouter", 1);
+        Fake ovh = new Fake("ovh", 2);
+        openrouter.failWith = 404;
+        openrouter.failMessage = "This model is unavailable for free";
+        ProviderRouter r = router(groups("openrouter", "ovh"), RoutingMode.PRIORITY, openrouter, ovh);
+
+        assertThat(r.chat(request("gpt-oss-120b")).id()).isEqualTo("ovh");
+        assertThat(openrouter.calls).hasValue(1);
+        assertThat(openrouter.seenModels).containsExactly("openai/gpt-oss-120b");
+        // ping снял провайдерный cooldown — в этой группе участника всё равно не зовём
+        openrouter.state().resetCooldown();
+        assertThat(openrouter.state().isAvailable(clock.instant())).isTrue();
+        openrouter.calls.set(0);
+        ovh.calls.set(0);
+        assertThat(r.chat(request("gpt-oss-120b")).id()).isEqualTo("ovh");
+        assertThat(openrouter.calls).hasValue(0);
+    }
+
+    @Test
+    void plain404InGroupIsTriedAgainAfterProviderCooldownResets() {
+        Fake groq = new Fake("groq", 1);
+        Fake ovh = new Fake("ovh", 2);
+        groq.failWith = 404;
+        groq.failMessage = "Not Found";
+        ProviderRouter r = router(groups("groq", "ovh"), RoutingMode.PRIORITY, groq, ovh);
+        assertThat(r.chat(request("gpt-oss-120b")).id()).isEqualTo("ovh");
+        groq.state().resetCooldown();
+        groq.failWith = 0;
+        assertThat(r.chat(request("gpt-oss-120b")).id()).isEqualTo("groq");
+    }
+
+    @Test
+    void modelUnavailableCooldownIsConfigurableAndExpires() {
+        MovingClock moving = new MovingClock(Instant.parse("2026-10-23T12:00:00Z"));
+        Fake openrouter = new Fake("openrouter", 1);
+        Fake ovh = new Fake("ovh", 2);
+        openrouter.failWith = 404;
+        openrouter.failMessage = "No endpoints found for openai/gpt-oss-120b";
+        ProviderRouter r = new ProviderRouter(List.of(openrouter, ovh), Duration.ofMinutes(5), moving,
+                RouterListener.NOOP, LimitsProperties.LEGACY, ProviderRouter.Sleeper.THREAD,
+                groups("openrouter", "ovh"), Duration.ofMinutes(10));
+        r.setRouting(new RoutingSettings(RoutingMode.PRIORITY, null));
+
+        assertThat(r.chat(request("gpt-oss-120b")).id()).isEqualTo("ovh");
+        openrouter.state().resetCooldown();
+        openrouter.failWith = 0;
+        moving.advance(Duration.ofMinutes(9));
+        assertThat(r.chat(request("gpt-oss-120b")).id()).isEqualTo("ovh");
+        assertThat(openrouter.calls).hasValue(1);
+
+        moving.advance(Duration.ofMinutes(2));
+        assertThat(r.chat(request("gpt-oss-120b")).id()).isEqualTo("openrouter");
+        assertThat(openrouter.calls).hasValue(2);
+    }
+
+    @Test
+    void zeroRetryAfterSkipsProviderForDefaultCooldown() {
+        Fake samba = new Fake("sambanova", 1);
+        Fake ovh = new Fake("ovh", 2);
+        samba.failWith = 429;
+        samba.retryAfter = Duration.ZERO;
+        ProviderRouter r = router(groups("sambanova", "ovh"), RoutingMode.PRIORITY, samba, ovh);
+
+        assertThat(r.chat(request("gpt-oss-120b")).id()).isEqualTo("ovh");
+        assertThat(samba.state().isAvailable(clock.instant())).isFalse();
+        assertThat(samba.state().cooldownUntil()).isEqualTo(clock.instant().plus(Duration.ofMinutes(5)));
+        assertThat(samba.state().cooldownReason()).isEqualTo("HTTP 429");
+        samba.calls.set(0);
+        ovh.calls.set(0);
+        assertThat(r.chat(request("gpt-oss-120b")).id()).isEqualTo("ovh");
+        assertThat(samba.calls).hasValue(0);
+    }
+
+    /** Часы, которые тест двигает сам: пауза группы проверяется по ним, а не по стене. */
+    static final class MovingClock extends Clock {
+        private Instant now;
+
+        MovingClock(Instant now) {
+            this.now = now;
+        }
+
+        void advance(Duration d) {
+            now = now.plus(d);
+        }
+
+        @Override
+        public Instant instant() {
+            return now;
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return ZoneOffset.UTC;
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            return this;
         }
     }
 }

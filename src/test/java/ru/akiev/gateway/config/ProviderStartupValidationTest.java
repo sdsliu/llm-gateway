@@ -64,7 +64,8 @@ class ProviderStartupValidationTest {
         assertThat(group.members()).extracting(ModelGroupProperties.Member::provider)
                 .containsExactly("groq", "ovh", "sambanova", "openrouter");
         assertThat(group.members()).extracting(ModelGroupProperties.Member::model)
-                .containsExactly("openai/gpt-oss-120b", "gpt-oss-120b", "gpt-oss-120b", "openai/gpt-oss-120b:free");
+                .containsExactly("openai/gpt-oss-120b", "gpt-oss-120b", "gpt-oss-120b", "openai/gpt-oss-120b");
+        assertThat(g.modelUnavailableCooldown()).isEqualTo(java.time.Duration.ofMinutes(10));
         assertThat(ProviderOrderConfigTest.provider(g, "ovh").maxConcurrency()).isEqualTo(2);
         assertThat(ProviderOrderConfigTest.provider(g, "groq").maxConcurrency()).isNull();
     }

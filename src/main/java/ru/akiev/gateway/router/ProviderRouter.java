@@ -3,6 +3,7 @@ package ru.akiev.gateway.router;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Locale;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
@@ -64,9 +65,12 @@ import ru.akiev.gateway.usage.RequestTags;
  *   <li>Запрос больше TPM всех провайдеров — сразу 413 request_too_large (ждать бесполезно).</li>
  *   <li>Места нет ни у кого сейчас — ждём до gateway.limits.max-wait (поток Tomcat спит: у нас Spring MVC,
  *       «один запрос = один поток»), потом 429 rate_limit_exceeded с Retry-After.</li>
- *   <li>429 от провайдера — пауза ({@link ProviderState#pauseAfter429}) и failover внутри группы,
- *       прежде чем клиент получит 429; паузу досрочно снимает первый успешный ping LimitDiscoveryService.
- *       Retry-After этого провайдера соблюдается (cooldown до него).</li>
+ *   <li>429 от провайдера — пауза ({@link ProviderState#pauseAfter429}) до положительного Retry-After
+ *       (или {@code default-cooldown}, если заголовка нет или он 0) и failover внутри группы,
+ *       прежде чем клиент получит 429. Пока пауза не кончилась, провайдер не выбирается;
+ *       успешный ping её не снимает.</li>
+ *   <li>404 «model unavailable» / «No endpoints found» у участника группы — не звать его в этой группе
+ *       до {@code model-unavailable-cooldown} (по умолчанию 10 минут), даже если провайдерный cooldown снят.</li>
  *   <li>pin-model-per-run — запросы с одним x-run-id идут к одному провайдеру, пока он доступен.</li>
  *   <li>HEADROOM вычитает число запросов в полёте: параллельный всплеск расходится по участникам группы,
  *       а не упирается в один и тот же запас лимита. {@code maxConcurrency} провайдера — жёсткий потолок.</li>
@@ -93,6 +97,12 @@ public class ProviderRouter {
     private final ModelGroups groups;
     /** Запросы, которые уже выбраны, но ещё не завершились. Учитывается в счёте HEADROOM и в maxConcurrency. */
     private final ConcurrentHashMap<String, AtomicInteger> inFlight = new ConcurrentHashMap<>();
+    /**
+     * Участник группы, который ответил 404 «модель недоступна»: ключ {@code группа\\0провайдер} → до какого момента
+     * его не выбираем в этой группе. Ping провайдера эту паузу не снимает (GET /models может быть 200).
+     */
+    private final ConcurrentHashMap<String, Instant> groupMemberUnavailable = new ConcurrentHashMap<>();
+    private final Duration modelUnavailableCooldown;
 
     /** Как ждать освобождения лимита. В проде — Thread.sleep, в тестах — «перемотка» фейковых часов. */
     @FunctionalInterface
@@ -118,6 +128,12 @@ public class ProviderRouter {
 
     public ProviderRouter(List<LlmProvider> providers, Duration defaultCooldown, Clock clock,
             RouterListener listener, LimitsProperties limits, Sleeper sleeper, ModelGroups groups) {
+        this(providers, defaultCooldown, clock, listener, limits, sleeper, groups, Duration.ofMinutes(10));
+    }
+
+    public ProviderRouter(List<LlmProvider> providers, Duration defaultCooldown, Clock clock,
+            RouterListener listener, LimitsProperties limits, Sleeper sleeper, ModelGroups groups,
+            Duration modelUnavailableCooldown) {
         this.listener = listener;
         this.providers = providers.stream().sorted(Comparator.comparingInt(LlmProvider::priority)).toList();
         this.defaultCooldown = defaultCooldown != null ? defaultCooldown : Duration.ofMinutes(5);
@@ -127,6 +143,8 @@ public class ProviderRouter {
         this.sleeper = sleeper != null ? sleeper : Sleeper.THREAD;
         this.pins = new RunPins(this.limits.pinTtl());
         this.groups = groups != null ? groups : ModelGroups.EMPTY;
+        this.modelUnavailableCooldown = modelUnavailableCooldown == null || modelUnavailableCooldown.isZero()
+                || modelUnavailableCooldown.isNegative() ? Duration.ofMinutes(10) : modelUnavailableCooldown;
     }
 
     /** Имена и алиасы групп моделей для /v1/models. */
@@ -331,6 +349,11 @@ public class ProviderRouter {
                 a.limitRetryAt = null;
                 a.concurrencyBlocked = false;
                 for (LlmProvider p : candidates) {
+                    if (modelUnavailable(a, p, now)) {
+                        log.debug("Пропускаем {}: model unavailable в группе {} до {}", p.name(),
+                                a.resolution.group().name(), groupMemberUnavailable.get(memberKey(a, p)));
+                        continue;
+                    }
                     ProviderState.Capacity c = p.state().capacity(now, a.tokens);
                     if (!c.fits()) {
                         boolean limit = isLimit(c.blockedBy()) && !c.neverFits();
@@ -385,7 +408,7 @@ public class ProviderRouter {
             if (wakeAt == null) {
                 for (LlmProvider p : a.modelCandidates()) {
                     if (!a.tried.contains(p)) {
-                        a.failures.add(p.name() + ": " + describeSkip(p, now, a.tokens));
+                        a.failures.add(p.name() + ": " + describeSkip(a, p, now, a.tokens));
                     }
                 }
                 return null;
@@ -459,7 +482,10 @@ public class ProviderRouter {
         return request;
     }
 
-    private String describeSkip(LlmProvider p, Instant now, long tokens) {
+    private String describeSkip(Attempt a, LlmProvider p, Instant now, long tokens) {
+        if (modelUnavailable(a, p, now)) {
+            return "model unavailable";
+        }
         Integer max = p.maxConcurrency();
         int flying = inFlight(p);
         if (max != null && max > 0 && flying >= max) {
@@ -530,7 +556,7 @@ public class ProviderRouter {
     /**
      * Общая обработка ошибки попытки: 413 — без паузы; обычный 4xx вне группы — наружу без failover;
      * 404/401/403/402 внутри группы (и для {@code auto}) — cooldown и следующий участник;
-     * 429 — пауза до Retry-After (или до первого успешного ping); прочие (5xx, таймаут) — cooldown.
+     * 429 — пауза до положительного Retry-After или default-cooldown (ping её не снимает); прочие (5xx, таймаут) — cooldown.
      * Возвращает нормально, если надо пробовать следующего.
      */
     private void onAttemptFailure(Attempt a, LlmProvider p, ProviderException e, String what) {
@@ -544,15 +570,21 @@ public class ProviderRouter {
             log.warn("Провайдер {} ответил {} (без failover): {}", p.name(), e.status(), snippet(e.getMessage()));
             throw e;
         }
-        Duration cd = e.retryAfter() != null ? e.retryAfter() : defaultCooldown;
+        Duration cd = pauseFor(e);
         Instant now = clock.instant();
+        if (a.resolution.kind() == ModelGroups.Kind.GROUP && isModelUnavailable(e)) {
+            Instant until = now.plus(modelUnavailableCooldown);
+            groupMemberUnavailable.put(memberKey(a, p), until);
+            log.warn("{}: {} — модель недоступна, в группе {} не выбираем до {}",
+                    what, p.name(), a.resolution.group().name(), until);
+        }
         if (e.status() == 429) {
             a.rateLimitHits++;
             if (a.soonestRetry == null || cd.compareTo(a.soonestRetry) < 0) {
                 a.soonestRetry = cd;
             }
             p.state().pauseAfter429(now, now.plus(cd), "HTTP 429");
-            log.warn("{}: {} ответил 429 — пауза до {} или до первого успешного ping, пробуем следующего. {}",
+            log.warn("{}: {} ответил 429 — пауза до {}, пробуем следующего. {}",
                     what, p.name(), now.plus(cd), snippet(e.getMessage()));
         } else {
             a.otherFailures++;
@@ -562,6 +594,47 @@ public class ProviderRouter {
         }
         a.attempted++;
         a.failures.add(p.name() + ": HTTP " + e.status());
+    }
+
+    /**
+     * Положительный Retry-After — столько и ждём. 0, отрицательное или пустое — {@code default-cooldown},
+     * иначе провайдер с {@code Retry-After: 0} (SambaNova так отвечает на 429) выбирается на каждый запрос.
+     */
+    private Duration pauseFor(ProviderException e) {
+        Duration ra = e.retryAfter();
+        if (ra != null && ra.compareTo(Duration.ZERO) > 0) {
+            return ra;
+        }
+        return defaultCooldown;
+    }
+
+    /** 404 «этой модели у провайдера нет» — не временный сбой запроса, а дырка в каталоге. */
+    static boolean isModelUnavailable(ProviderException e) {
+        if (e == null || e.status() != 404 || e.getMessage() == null) {
+            return false;
+        }
+        String m = e.getMessage().toLowerCase(Locale.ROOT);
+        return m.contains("unavailable") || m.contains("no endpoints found");
+    }
+
+    private boolean modelUnavailable(Attempt a, LlmProvider p, Instant now) {
+        if (a.resolution.kind() != ModelGroups.Kind.GROUP || a.resolution.group() == null) {
+            return false;
+        }
+        String key = memberKey(a, p);
+        Instant until = groupMemberUnavailable.get(key);
+        if (until == null) {
+            return false;
+        }
+        if (!now.isBefore(until)) {
+            groupMemberUnavailable.remove(key, until);
+            return false;
+        }
+        return true;
+    }
+
+    private static String memberKey(Attempt a, LlmProvider p) {
+        return a.resolution.group().name() + "\0" + p.name();
     }
 
     /**

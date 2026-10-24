@@ -189,7 +189,7 @@ public class OpenAiCompatibleProvider implements LlmProvider {
         } catch (WebClientResponseException e) {
             // Ошибка HTTP от провайдера. Заголовки лимитов приходят и в ответе 429 — читаем их тоже.
             updateLimits(e.getHeaders());
-            Duration retryAfter = RateLimitHeaders.retryAfter(e.getHeaders(), clock.instant());
+            Duration retryAfter = retryAfter(e.getHeaders());
             throw new ProviderException(e.getStatusCode().value(),
                     "Provider " + name() + " returned " + e.getStatusCode().value() + ": "
                             + e.getResponseBodyAsString(), retryAfter, e);
@@ -262,7 +262,7 @@ public class OpenAiCompatibleProvider implements LlmProvider {
             return new ProviderException(w.getStatusCode().value(),
                     "Provider " + name() + " returned " + w.getStatusCode().value() + ": "
                             + w.getResponseBodyAsString(),
-                    RateLimitHeaders.retryAfter(w.getHeaders(), clock.instant()), w);
+                    retryAfter(w.getHeaders()), w);
         }
         if (hasCause(e, TimeoutException.class)) {
             return new ProviderException(504, "Provider " + name() + " stream timed out after " + timeout, e);
@@ -303,6 +303,23 @@ public class OpenAiCompatibleProvider implements LlmProvider {
             state.cooldown(now.plus(wait), "remaining requests = 0");
             log.warn("Провайдер {}: лимит запросов исчерпан, пауза {}", name(), wait);
         }
+    }
+
+    /**
+     * Сколько ждать перед повтором: заголовок Retry-After, иначе x-ratelimit-reset-* / ratelimit-reset.
+     * 0 и отрицательные не считаются — роутер подставит default-cooldown.
+     */
+    private Duration retryAfter(HttpHeaders headers) {
+        Instant now = clock.instant();
+        Duration retry = RateLimitHeaders.retryAfter(headers, now);
+        if (retry != null && retry.compareTo(Duration.ZERO) > 0) {
+            return retry;
+        }
+        Duration reset = RateLimitHeaders.resetRequests(headers, now);
+        if (reset != null && reset.compareTo(Duration.ZERO) > 0) {
+            return reset;
+        }
+        return null;
     }
 
     private static boolean hasCause(Throwable t, Class<? extends Throwable> type) {

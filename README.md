@@ -134,7 +134,8 @@ Ping по расписанию: `gateway.health.scheduled=true` (интерва�
 
 ```yaml
 gateway:
-  default-cooldown: 5m            # пауза после 429/5xx/402/таймаута без Retry-After
+  default-cooldown: 5m            # пауза после 429/5xx/402/таймаута без Retry-After (и при Retry-After: 0)
+  model-unavailable-cooldown: 10m # 404 «model unavailable» — не звать участника в этой группе
   openrouter:
     name: openrouter              # какой провайдер опрашивать через GET /key
     poll-interval: PT5M           # ISO-8601
@@ -370,8 +371,10 @@ curl -s 'localhost:4000/stats/efficiency?days=30'
   `429 rate_limit_exceeded` с `Retry-After`.
 - Запрос больше TPM **всех** провайдеров: сразу `413 request_too_large`, ждать бесполезно.
 
-**7. 429 от провайдера**: провайдер встаёт на паузу (до `Retry-After` или `default-cooldown`), запрос уходит к
-следующему. Пауза заканчивается раньше, если провайдер успешно ответит на очередной перепинг (раз в минуту).
+**7. 429 от провайдера**: провайдер встаёт на паузу (до положительного `Retry-After`, иначе `x-ratelimit-reset-*`,
+иначе `default-cooldown`) и **пропускается**, пока пауза не кончится. `Retry-After: 0` не считается «можно сразу»:
+это тот же `default-cooldown`. Успешный ping (`GET /models` часто 200, пока chat ещё в лимите — так у SambaNova)
+паузу **не снимает**. Следующий запрос к группе идёт к другим участникам, а не снова в 429.
 
 **8. Одна модель на попытку** (`gateway.limits.pin-model-per-run: true`): все запросы с одним `x-run-id` уходят к
 одному провайдеру, чтобы агент не менял модель посреди задачи. Если у этого провайдера кончилась минута, запрос ждёт.
@@ -473,7 +476,7 @@ gateway:
         - provider: sambanova
           model: gpt-oss-120b
         - provider: openrouter
-          model: openai/gpt-oss-120b:free   # платный id OpenRouter: openai/gpt-oss-120b
+          model: openai/gpt-oss-120b        # платный id; :free → 404 «unavailable for free»
 ```
 
 Имя модели `auto` (если нет группы с таким именем) значит «любой включённый провайдер, каждому его модель из конфига».
@@ -484,6 +487,11 @@ gateway:
 иногда ещё и не JSON. Ответ с другим полем `model` (или не-JSON до первого чанка стрима) — сбой этой попытки:
 провайдер в cooldown, запрос идёт следующему участнику. Суффикс варианта считается той же моделью
 (`openai/gpt-oss-120b:free` и `openai/gpt-oss-120b`). Прямой вызов OpenRouter не из группы по-прежнему шлёт `fallback-models`.
+
+404 с текстом «unavailable» или «No endpoints found» помечает участника недоступным **в этой группе** на
+`gateway.model-unavailable-cooldown` (по умолчанию 10 минут). Следующие запросы группы его не вызывают, даже если
+провайдерный cooldown уже снят или ping ответил 200. Обычный 404 («Not Found») по-прежнему только короткий cooldown
+провайдера. Вне группы 404 «unavailable» клиенту, без этой паузы.
 
 Что слать Nori: **`gpt-oss-120b`** или алиас **`openai/gpt-oss-120b`**. Оба имени есть в `GET /v1/models`.
 Неизвестная модель по-прежнему означает «все провайдеры», но обычный 404 тогда не вызывает failover —
