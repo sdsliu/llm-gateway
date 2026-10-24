@@ -17,11 +17,25 @@ public interface LlmProvider {
     ChatResponse chat(ChatRequest request);
 
     /**
+     * То же, что {@link #chat(ChatRequest)}, но {@code exactModel} — вызов участника группы моделей:
+     * отправить ровно {@code request.model()} и не подключать запасные модели провайдера
+     * (у OpenRouter это список {@code models} и provider-level fallback).
+     */
+    default ChatResponse chat(ChatRequest request, boolean exactModel) {
+        return chat(request);
+    }
+
+    /**
      * Стриминговый вызов (stream=true). Возвращает Flux «сырых» JSON-строк чанков
      * (то, что идёт после "data: " в SSE провайдера), без финального [DONE].
      * Ошибки HTTP/таймауты приходят как сигнал onError с {@link ProviderException}.
      */
     Flux<String> chatStream(ChatRequest request);
+
+    /** Стрим с тем же смыслом {@code exactModel}, что у {@link #chat(ChatRequest, boolean)}. */
+    default Flux<String> chatStream(ChatRequest request, boolean exactModel) {
+        return chatStream(request);
+    }
 
     /** Модели, которые провайдер отдаёт в /v1/models. */
     List<String> models();

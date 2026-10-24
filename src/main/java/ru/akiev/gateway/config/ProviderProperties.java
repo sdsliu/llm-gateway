@@ -26,7 +26,9 @@ import org.springframework.http.HttpHeaders;
  *                    параметр OpenRouter (https://openrouter.ai/docs/guides/routing/model-fallbacks).
  *                    Задавайте только для провайдеров, которые его поддерживают; пусто — не отправляем.
  * @param timeout     таймаут запроса к ЭТОМУ провайдеру (non-stream — весь ответ, stream — пауза до/между
- *                    чанками). Истёк — 504, cooldown и failover на следующего провайдера.
+ *                    чанками). По умолчанию 30 с — заметно короче типичного клиентского таймаута (~120 с),
+ *                    чтобы зависший участник группы успел отдать 504 и failover, а не съесть весь бюджет
+ *                    клиента. Истёк — 504, cooldown и failover на следующего провайдера.
  * @param extraBody   дополнительные поля верхнего уровня в теле /chat/completions, специфичные для
  *                    провайдера (например Z.ai {@code thinking: {type: disabled}}). Поля, которые
  *                    формирует сам шлюз (model, messages, stream, stream_options, models), не переопределяются.
@@ -50,7 +52,7 @@ public record ProviderProperties(
         String apiKey,
         @NotBlank String model,
         @DefaultValue("100") int priority,
-        @DefaultValue("120s") Duration timeout,
+        @DefaultValue("30s") Duration timeout,
         @Valid Limits limits,
         @DefaultValue("true") boolean streamUsage,
         @DefaultValue("/models") String pingPath,

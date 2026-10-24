@@ -56,6 +56,11 @@ class ModelGroupRoutingTest {
         volatile Integer maxConcurrency;
         volatile CountDownLatch arrived;
         volatile CountDownLatch release;
+        /** Если задан — ответ якобы от этой модели, а не от запрошенной. */
+        volatile String servedModel;
+        /** Сырой первый чанк стрима. null — JSON с id и model. */
+        volatile String streamChunk;
+        volatile boolean exactModel;
 
         Fake(String name, int priority, String... models) {
             this.name = name;
@@ -76,7 +81,13 @@ class ModelGroupRoutingTest {
             if (failWith != 0) {
                 throw new ProviderException(failWith, failMessage != null ? failMessage : name + " failed", retryAfter, null);
             }
-            return new ChatResponse(name, "chat.completion", 1L, request.model(), List.of(), null);
+            String model = servedModel != null ? servedModel : request.model();
+            return new ChatResponse(name, "chat.completion", 1L, model, List.of(), null);
+        }
+
+        public ChatResponse chat(ChatRequest request, boolean exactModel) {
+            this.exactModel = exactModel;
+            return chat(request);
         }
 
         public Flux<String> chatStream(ChatRequest request) {
@@ -86,7 +97,16 @@ class ModelGroupRoutingTest {
                 return Flux.error(new ProviderException(failWith,
                         failMessage != null ? failMessage : name + " failed", retryAfter, null));
             }
-            return Flux.just("{\"id\":\"" + name + "\"}");
+            if (streamChunk != null) {
+                return Flux.just(streamChunk);
+            }
+            String model = servedModel != null ? servedModel : request.model();
+            return Flux.just("{\"id\":\"" + name + "\",\"model\":\"" + model + "\"}");
+        }
+
+        public Flux<String> chatStream(ChatRequest request, boolean exactModel) {
+            this.exactModel = exactModel;
+            return chatStream(request);
         }
 
         private void awaitTurn() {
@@ -345,12 +365,12 @@ class ModelGroupRoutingTest {
         assertThat(b.calls).hasValue(0);
     }
 
-    static String ok(String text) {
+    static String ok(String model, String text) {
         return """
-                {"id":"x","object":"chat.completion","created":1,"model":"m",
+                {"id":"x","object":"chat.completion","created":1,"model":"%s",
                  "choices":[{"index":0,"message":{"role":"assistant","content":"%s"},"finish_reason":"stop"}],
                  "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}
-                """.formatted(text);
+                """.formatted(model, text);
     }
 
     @Test
@@ -362,7 +382,8 @@ class ModelGroupRoutingTest {
         try {
             groq.enqueue(new MockResponse().setResponseCode(404).setHeader("Content-Type", "application/json")
                     .setBody("{\"error\":{\"message\":\"Not Found\",\"code\":404}}"));
-            ovh.enqueue(new MockResponse().setHeader("Content-Type", "application/json").setBody(ok("from-ovh")));
+            ovh.enqueue(new MockResponse().setHeader("Content-Type", "application/json")
+                    .setBody(ok("gpt-oss-120b", "from-ovh")));
             ProviderProperties groqProps = new ProviderProperties("groq", groq.url("/v1").toString(), "k-groq",
                     "openai/gpt-oss-120b", 1, Duration.ofSeconds(5), null, true, "/models", null);
             ProviderProperties ovhProps = new ProviderProperties("ovh", ovh.url("/v1").toString(), "k-ovh",
@@ -387,6 +408,145 @@ class ModelGroupRoutingTest {
             assertThat(groqProvider.state().cooldownReason()).isEqualTo("HTTP 404");
         } finally {
             groq.shutdown();
+            ovh.shutdown();
+        }
+    }
+
+    @Test
+    void mismatchedGroupModelFailsOver() {
+        Fake openrouter = new Fake("openrouter", 1, "nvidia/nemotron-3-super-120b-a12b:free");
+        Fake ovh = new Fake("ovh", 2, "gpt-oss-120b");
+        openrouter.servedModel = "poolside/laguna-s-2.1:free";
+        ProviderRouter r = router(groups("openrouter", "ovh"), RoutingMode.PRIORITY, openrouter, ovh);
+
+        assertThat(r.chat(request("gpt-oss-120b")).id()).isEqualTo("ovh");
+        assertThat(openrouter.exactModel).isTrue();
+        assertThat(ovh.exactModel).isTrue();
+        assertThat(openrouter.seenModels).containsExactly("openai/gpt-oss-120b:free");
+        assertThat(openrouter.state().cooldownReason()).isEqualTo("HTTP 502");
+        assertThat(openrouter.state().isAvailable(clock.instant())).isFalse();
+
+        // :free и базовый id — одна модель, failover не нужен
+        openrouter.state().resetCooldown();
+        openrouter.servedModel = "openai/gpt-oss-120b";
+        openrouter.calls.set(0);
+        ovh.calls.set(0);
+        assertThat(r.chat(request("gpt-oss-120b")).id()).isEqualTo("openrouter");
+        assertThat(ovh.calls).hasValue(0);
+
+        // стрим: чужая модель до первого чанка — failover
+        openrouter.servedModel = "nvidia/nemotron-3-super-120b-a12b:free";
+        openrouter.calls.set(0);
+        StreamSession session = r.openStream(request("gpt-oss-120b"));
+        try {
+            assertThat(session.provider().name()).isEqualTo("ovh");
+        } finally {
+            session.close();
+        }
+        assertThat(openrouter.state().cooldownReason()).isEqualTo("HTTP 502");
+
+        // не-JSON до первого чанка — тоже failover внутри группы
+        openrouter.state().resetCooldown();
+        openrouter.streamChunk = "not json at all";
+        openrouter.calls.set(0);
+        ovh.calls.set(0);
+        session = r.openStream(request("gpt-oss-120b"));
+        try {
+            assertThat(session.provider().name()).isEqualTo("ovh");
+        } finally {
+            session.close();
+        }
+        assertThat(ovh.calls).hasValue(1);
+    }
+
+    @Test
+    void mismatchedModelOutsideGroupIsReturned() {
+        Fake a = new Fake("a", 1, "m-a");
+        Fake b = new Fake("b", 2, "m-b");
+        a.servedModel = "nvidia/nemotron-3-super-120b-a12b:free";
+        ProviderRouter r = router(ModelGroups.EMPTY, RoutingMode.PRIORITY, a, b);
+        assertThat(r.chat(request("m-a")).model()).isEqualTo("nvidia/nemotron-3-super-120b-a12b:free");
+        assertThat(a.exactModel).isFalse();
+        assertThat(b.calls).hasValue(0);
+    }
+
+    @Test
+    void openRouterGroupMemberDisablesFallbacksAndMismatchedModelFailsOver() throws Exception {
+        MockWebServer openrouter = new MockWebServer();
+        MockWebServer ovh = new MockWebServer();
+        openrouter.start();
+        ovh.start();
+        try {
+            openrouter.enqueue(new MockResponse().setHeader("Content-Type", "application/json")
+                    .setBody(ok("nvidia/nemotron-3-super-120b-a12b:free", "substituted")));
+            ovh.enqueue(new MockResponse().setHeader("Content-Type", "application/json")
+                    .setBody(ok("gpt-oss-120b", "from-ovh")));
+            ProviderProperties orProps = new ProviderProperties("openrouter", openrouter.url("/api/v1").toString(), "k-or",
+                    "nvidia/nemotron-3-super-120b-a12b:free", 1, Duration.ofSeconds(5), null, true, "/models",
+                    List.of("google/gemma-4-31b-it:free", "poolside/laguna-s-2.1:free", "openrouter/free"),
+                    Map.of("route", "fallback", "provider", Map.of("order", List.of("DeepInfra"))));
+            ProviderProperties ovhProps = new ProviderProperties("ovh", ovh.url("/v1").toString(), "k-ovh",
+                    "gpt-oss-120b", 2, Duration.ofSeconds(5), null, true, "/models", null);
+            var gp = new ru.akiev.gateway.config.GatewayProperties(
+                    List.of(orProps, ovhProps), Duration.ofMinutes(5), List.of(gptOss()));
+            ProviderRouter r = new ProviderConfig().providerRouter(WebClient.builder(), gp, clock,
+                    org.mockito.Mockito.mock(UsageService.class),
+                    new RoutingProperties(RoutingMode.PRIORITY, null), LimitsProperties.LEGACY);
+
+            assertThat(r.chat(request("gpt-oss-120b")).choices().get(0).message().content()).isEqualTo("from-ovh");
+            String orBody = openrouter.takeRequest(1, TimeUnit.SECONDS).getBody().readUtf8();
+            assertThat(orBody).contains("\"model\":\"openai/gpt-oss-120b:free\"")
+                    .contains("\"allow_fallbacks\":false")
+                    .contains("DeepInfra")
+                    .doesNotContain("\"models\"")
+                    .doesNotContain("gemma")
+                    .doesNotContain("laguna")
+                    .doesNotContain("\"route\"")
+                    .doesNotContain("nemotron");
+            assertThat(ovh.takeRequest(1, TimeUnit.SECONDS).getBody().readUtf8())
+                    .contains("\"model\":\"gpt-oss-120b\"")
+                    .doesNotContain("allow_fallbacks");
+            LlmProvider or = r.providers().stream().filter(p -> p.name().equals("openrouter")).findFirst().orElseThrow();
+            assertThat(or.state().cooldownReason()).isEqualTo("HTTP 502");
+        } finally {
+            openrouter.shutdown();
+            ovh.shutdown();
+        }
+    }
+
+    @Test
+    void groupMemberTimeoutFailsOverBeforeClientTimeout() throws Exception {
+        MockWebServer samba = new MockWebServer();
+        MockWebServer ovh = new MockWebServer();
+        samba.start();
+        ovh.start();
+        try {
+            samba.enqueue(new MockResponse().setHeader("Content-Type", "application/json")
+                    .setBody(ok("gpt-oss-120b", "too-late")).setHeadersDelay(2, TimeUnit.SECONDS));
+            ovh.enqueue(new MockResponse().setHeader("Content-Type", "application/json")
+                    .setBody(ok("gpt-oss-120b", "from-ovh")));
+            var sambaProps = new ProviderProperties("sambanova", samba.url("/v1").toString(), "k",
+                    "gpt-oss-120b", 1, Duration.ofMillis(400), null, true, "/models", null);
+            var ovhProps = new ProviderProperties("ovh", ovh.url("/v1").toString(), "k",
+                    "gpt-oss-120b", 2, Duration.ofSeconds(5), null, true, "/models", null);
+            var group = new ModelGroupProperties("gpt-oss-120b", List.of(), List.of(
+                    new Member("sambanova", "gpt-oss-120b"),
+                    new Member("ovh", "gpt-oss-120b")));
+            ProviderRouter r = new ProviderRouter(List.of(
+                    new ru.akiev.gateway.provider.OpenAiCompatibleProvider(WebClient.builder(), sambaProps),
+                    new ru.akiev.gateway.provider.OpenAiCompatibleProvider(WebClient.builder(), ovhProps)),
+                    Duration.ofMinutes(5), clock, RouterListener.NOOP, LimitsProperties.LEGACY, ProviderRouter.Sleeper.THREAD,
+                    ModelGroups.compile(List.of(group), List.of("sambanova", "ovh")));
+            r.setRouting(new RoutingSettings(RoutingMode.PRIORITY, null));
+
+            long start = System.nanoTime();
+            assertThat(r.chat(request("gpt-oss-120b")).choices().get(0).message().content()).isEqualTo("from-ovh");
+            assertThat(Duration.ofNanos(System.nanoTime() - start)).isLessThan(Duration.ofSeconds(3));
+            LlmProvider hung = r.providers().stream().filter(p -> p.name().equals("sambanova")).findFirst().orElseThrow();
+            assertThat(hung.state().cooldownReason()).isEqualTo("HTTP 504");
+            assertThat(ovh.getRequestCount()).isEqualTo(1);
+        } finally {
+            samba.shutdown();
             ovh.shutdown();
         }
     }

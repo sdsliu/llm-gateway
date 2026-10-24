@@ -69,7 +69,9 @@ gateway:
       api-key: ${GROQ_API_KEY:}
       model: openai/gpt-oss-120b
       priority: 1
-      timeout: 120s
+      # Короче клиентского таймаута (Nori ~120s): зависший участник группы отдаёт 504 и failover,
+      # а не съедает весь бюджет клиента. То же у openrouter и sambanova.
+      timeout: 30s
       # Fallback: при старте Groq сообщает реальные лимиты в x-ratelimit-* (limit-requests = RPD, limit-tokens = TPM).
       limits:
         rpm: 30
@@ -165,7 +167,8 @@ gateway:
         - poolside/laguna-s-2.1:free
         - openrouter/free
       priority: 6
-      timeout: 120s
+      # 30s, не 120s: иначе failover внутри группы не успевает до таймаута клиента.
+      timeout: 30s
       limits:
         rpm: 20
         rpd: 50
@@ -183,7 +186,8 @@ gateway:
       api-key: ${SAMBANOVA_API_KEY:}
       model: gpt-oss-120b
       priority: 7
-      timeout: 120s
+      # 30s, не 120s: SambaNova часто молчит до клиентского таймаута, и failover уже некому отдать.
+      timeout: 30s
       limits:
         rpm: 20
         rpd: 20
@@ -207,6 +211,10 @@ gateway:
   # auto (зарезервировано, группу с таким именем не задаём) — любой включённый провайдер со своей моделью.
   # 404/401/403/402 участника — cooldown и следующий в группе; 429 — пауза по Retry-After и тоже следующий,
   # клиенту 429 только если 429 ответила вся группа.
+  # Участнику уходит ровно его model: без списка fallback-моделей. У OpenRouter ещё
+  # provider.allow_fallbacks=false и без route=fallback. Если в ответе model другая
+  # (nemotron, laguna, flint) или стрим начался не с JSON — попытка сбойная, берём следующего.
+  # Таймаут участника держите заметно ниже клиентского (по умолчанию 30s при клиенте ~120s).
   model-groups:
     - name: gpt-oss-120b
       aliases:

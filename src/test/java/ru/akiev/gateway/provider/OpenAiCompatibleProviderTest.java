@@ -178,6 +178,90 @@ class OpenAiCompatibleProviderTest {
     }
 
     @Test
+    void exactGroupCallOmitsFallbacksAndDisablesOpenRouterSubstitution() throws Exception {
+        server.enqueue(new MockResponse().setHeader("Content-Type", "application/json").setBody(OPENAI_RESPONSE));
+        var props = new ProviderProperties("openrouter", server.url("/api/v1").toString(), "test-key",
+                "nvidia/nemotron-3-super-120b-a12b:free", 1, Duration.ofSeconds(5), null, true, "/models",
+                List.of("google/gemma-4-31b-it:free", "poolside/laguna-s-2.1:free", "openrouter/free"),
+                Map.of("route", "fallback", "provider", Map.of("order", List.of("DeepInfra"))))
+                .withExtraModels(List.of("openai/gpt-oss-120b:free"));
+        var req = new ChatRequest("openai/gpt-oss-120b:free", List.of(new Message("user", "hi")), false,
+                null, null, 10, null, null, null, null);
+
+        new OpenAiCompatibleProvider(WebClient.builder(), props).chat(req, true);
+
+        String body = server.takeRequest(1, TimeUnit.SECONDS).getBody().readUtf8();
+        assertThat(body).contains("\"model\":\"openai/gpt-oss-120b:free\"")
+                .contains("\"allow_fallbacks\":false")
+                .contains("DeepInfra")
+                .doesNotContain("\"models\"")
+                .doesNotContain("gemma")
+                .doesNotContain("laguna")
+                .doesNotContain("openrouter/free")
+                .doesNotContain("\"route\"")
+                .doesNotContain("nemotron");
+    }
+
+    @Test
+    void exactStreamCallOmitsOpenRouterFallbacks() throws Exception {
+        server.enqueue(new MockResponse().setHeader("Content-Type", "text/event-stream")
+                .setBody("data: {\"id\":\"x\",\"model\":\"openai/gpt-oss-120b:free\",\"choices\":[]}\n\ndata: [DONE]\n\n"));
+        var req = new ChatRequest("openai/gpt-oss-120b:free", List.of(new Message("user", "hi")), true,
+                null, null, 10, null, null, null, null);
+        openRouter(List.of("google/gemma-4-31b-it:free", "openrouter/free"))
+                .chatStream(req, true).collectList().block(Duration.ofSeconds(5));
+        String body = server.takeRequest(1, TimeUnit.SECONDS).getBody().readUtf8();
+        assertThat(body).contains("\"model\":\"openai/gpt-oss-120b:free\"")
+                .contains("\"allow_fallbacks\":false")
+                .contains("\"stream\":true")
+                .doesNotContain("\"models\"")
+                .doesNotContain("gemma");
+    }
+
+    @Test
+    void exactCallOnOtherProviderDoesNotSendOpenRouterRouting() throws Exception {
+        server.enqueue(new MockResponse().setHeader("Content-Type", "application/json").setBody(OPENAI_RESPONSE));
+        var props = new ProviderProperties("groq", server.url("/v1").toString(), "test-key",
+                "openai/gpt-oss-120b", 1, Duration.ofSeconds(5), null, true, "/models",
+                List.of("should-not-send"));
+        var req = new ChatRequest("openai/gpt-oss-120b", List.of(new Message("user", "hi")), false,
+                null, null, 10, null, null, null, null);
+
+        new OpenAiCompatibleProvider(WebClient.builder(), props).chat(req, true);
+
+        String body = server.takeRequest(1, TimeUnit.SECONDS).getBody().readUtf8();
+        assertThat(body).contains("\"model\":\"openai/gpt-oss-120b\"")
+                .doesNotContain("\"models\"")
+                .doesNotContain("should-not-send")
+                .doesNotContain("allow_fallbacks")
+                .doesNotContain("\"provider\"");
+    }
+
+    @Test
+    void openRouterHostDisablesFallbacksEvenIfNameDiffers() throws Exception {
+        server.enqueue(new MockResponse().setHeader("Content-Type", "application/json").setBody(OPENAI_RESPONSE));
+        String base = server.url("/openrouter.ai/api/v1").toString();
+        var props = new ProviderProperties("backup", base, "test-key",
+                "openai/gpt-oss-120b:free", 1, Duration.ofSeconds(5), null, true, "/models",
+                List.of("openrouter/free"));
+        var req = new ChatRequest("openai/gpt-oss-120b:free", List.of(new Message("user", "hi")), false,
+                null, null, 10, null, null, null, null);
+        new OpenAiCompatibleProvider(WebClient.builder(), props).chat(req, true);
+        String body = server.takeRequest(1, TimeUnit.SECONDS).getBody().readUtf8();
+        assertThat(body).contains("\"allow_fallbacks\":false")
+                .contains("\"model\":\"openai/gpt-oss-120b:free\"")
+                .doesNotContain("\"models\"");
+    }
+
+    @Test
+    void nullTimeoutDefaultsTo30Seconds() {
+        var props = new ProviderProperties("sambanova", server.url("/v1").toString(), "k",
+                "gpt-oss-120b", 1, null, null, true, "/models", null);
+        var p = new OpenAiCompatibleProvider(WebClient.builder(), props);
+        assertThat(p.requestTimeout()).isEqualTo(Duration.ofSeconds(30));
+    }
+
+    @Test
     void http402BecomesRetriableProviderException() {
         server.enqueue(new MockResponse().setResponseCode(402)
                 .setBody("{\"error\":{\"code\":\"PAYMENT_METHOD_REQUIRED\"}}"));

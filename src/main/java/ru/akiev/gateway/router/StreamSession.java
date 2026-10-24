@@ -21,6 +21,26 @@ public class StreamSession implements AutoCloseable {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
+    /**
+     * Поле {@code model} первого чанка. {@code json == false} — чанк не JSON (для группы это сбой попытки).
+     * {@code model == null} — JSON без модели, проверить подмену нельзя.
+     */
+    record ChunkModel(boolean json, String model) {
+    }
+
+    static ChunkModel parseChunk(String json) {
+        try {
+            JsonNode n = MAPPER.readTree(json);
+            if (n != null && n.isObject() && n.hasNonNull("model")) {
+                String text = n.get("model").asText("").trim();
+                return new ChunkModel(true, text.isEmpty() ? null : text);
+            }
+            return new ChunkModel(true, null);
+        } catch (Exception e) {
+            return new ChunkModel(false, null);
+        }
+    }
+
     private final LlmProvider provider;
     private final Stream<String> stream;
     private final Iterator<String> iterator;

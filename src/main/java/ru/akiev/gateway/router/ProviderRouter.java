@@ -41,6 +41,9 @@ import ru.akiev.gateway.usage.RequestTags;
  *   <li>Внутри группы моделей (и для модели {@code auto}) 404/401/403/402 — тоже failover:
  *       провайдер уходит в cooldown, пробуем следующего участника. Вне группы обычный 404
  *       по-прежнему отдаётся клиенту (ошибка конкретного запроса, а не «этот провайдер мёртв»).</li>
+ *   <li>Участнику группы уходит ровно его model id, без запасных моделей. Если в ответе (или в первом
+ *       чанке стрима) поле {@code model} — другая модель, попытка считается сбоем (502) и идём дальше.
+ *       Не-JSON до первого чанка — тоже сбой. Суффикс варианта ({@code :free}) не считается другой моделью.</li>
  *   <li>Прочие 4xx (например 400 — кривой запрос) отдаём клиенту сразу: другой провайдер
  *       ответит так же.</li>
  *   <li>Никого не осталось — {@link AllProvidersUnavailableException} → HTTP 503.</li>
@@ -561,6 +564,41 @@ public class ProviderRouter {
         a.failures.add(p.name() + ": HTTP " + e.status());
     }
 
+    /**
+     * Участник группы должен ответить своей моделью. Пустой {@code actual} не проверяем (провайдер
+     * не прислал поле). Совпадает точное имя или то же имя без одного суффикса {@code :variant}
+     * ({@code openai/gpt-oss-120b:free} и {@code openai/gpt-oss-120b} — одна модель; nemotron / laguna / flint — нет).
+     */
+    private static void ensureServedModel(LlmProvider p, String requested, String actual) {
+        if (modelsMatch(requested, actual)) {
+            return;
+        }
+        throw new ProviderException(502, "Provider " + p.name() + " served model '" + actual
+                + "' instead of '" + requested + "'", null);
+    }
+
+    static boolean modelsMatch(String requested, String actual) {
+        if (actual == null || actual.isBlank() || requested == null || requested.isBlank()) {
+            return true;
+        }
+        String req = requested.trim();
+        String got = actual.trim();
+        return req.equals(got) || stripVariant(req).equals(stripVariant(got));
+    }
+
+    /** {@code org/name:variant} → {@code org/name}. Суффикс без {@code /}. */
+    private static String stripVariant(String id) {
+        int colon = id.lastIndexOf(':');
+        if (colon <= 0) {
+            return id;
+        }
+        String suffix = id.substring(colon + 1);
+        if (suffix.isEmpty() || suffix.indexOf('/') >= 0) {
+            return id;
+        }
+        return id.substring(0, colon);
+    }
+
     /** 404/401/403/402 — проблема этого провайдера (битый URL, нет модели, нет оплаты, протух ключ). */
     private static boolean isProviderSpecificFailure(ProviderException e) {
         int status = e.status();
@@ -578,7 +616,11 @@ public class ProviderRouter {
                     p.name(), p.priority(), routing.mode(), outgoing.model(), a.tokens, inFlight(p));
             long start = System.nanoTime();
             try {
-                ChatResponse resp = p.chat(outgoing);
+                boolean exact = a.resolution.kind() == ModelGroups.Kind.GROUP;
+                ChatResponse resp = p.chat(outgoing, exact);
+                if (exact) {
+                    ensureServedModel(p, outgoing.model(), resp == null ? null : resp.model());
+                }
                 p.state().budget().settle(s.reservation(), usageTokens(resp));
                 listener.onSuccess(p, resp, (System.nanoTime() - start) / 1_000_000);
                 return resp;
@@ -628,13 +670,22 @@ public class ProviderRouter {
             Stream<String> stream = null;
             boolean handedOff = false;
             try {
-                stream = p.chatStream(outgoing).toStream(STREAM_PREFETCH);
+                boolean exact = a.resolution.kind() == ModelGroups.Kind.GROUP;
+                stream = p.chatStream(outgoing, exact).toStream(STREAM_PREFETCH);
                 Iterator<String> it = stream.iterator();
                 if (!it.hasNext()) {
                     // Провайдер закрыл поток, не прислав ни одного чанка — считаем сбоем.
                     throw new ProviderException(502, "Provider " + p.name() + " returned empty stream", null);
                 }
                 String first = it.next();
+                if (exact) {
+                    StreamSession.ChunkModel chunk = StreamSession.parseChunk(first);
+                    if (!chunk.json()) {
+                        throw new ProviderException(502,
+                                "Provider " + p.name() + " returned a non-JSON stream chunk", null);
+                    }
+                    ensureServedModel(p, outgoing.model(), chunk.model());
+                }
                 StreamSession session = new StreamSession(p, stream, it, first, start,
                         request.clientWantsStreamUsage(), settling(current), () -> releaseSelection(current));
                 handedOff = true;
