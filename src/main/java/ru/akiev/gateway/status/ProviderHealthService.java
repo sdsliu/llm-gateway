@@ -69,7 +69,7 @@ public class ProviderHealthService {
         this.scheduled = scheduled;
         for (ProviderProperties p : props.providers()) {
             providers.put(p.name(), p);
-            if (p.enabled()) {
+            if (p.usable()) {
                 clients.put(p.name(), builder.clone().baseUrl(p.baseUrl())
                         .codecs(c -> c.defaultCodecs().maxInMemorySize((int) maxBodySize.toBytes()))
                         .defaultHeaders(p::applyAuth).build());
@@ -112,7 +112,8 @@ public class ProviderHealthService {
             c = models.get(name);
         }
         if (c == null) {
-            return new ModelsCache(List.of(), null, clients.containsKey(name) ? "ещё не загружено" : "api-key не задан", null);
+            String why = clients.containsKey(name) ? "ещё не загружено" : skipReason(name);
+            return new ModelsCache(List.of(), null, why, null);
         }
         return c;
     }
@@ -123,10 +124,19 @@ public class ProviderHealthService {
         return m;
     }
 
+    private String skipReason(String name) {
+        ProviderProperties p = providers.get(name);
+        if (p == null) {
+            return "неизвестный провайдер";
+        }
+        String why = p.disabledReason();
+        return why != null ? why : "api-key не задан";
+    }
+
     private Mono<PingResult> pingMono(String name) {
         WebClient client = clients.get(name);
         if (client == null) {
-            PingResult r = new PingResult(name, "skipped", null, null, "api-key не задан", clock.instant(), null);
+            PingResult r = new PingResult(name, "skipped", null, null, skipReason(name), clock.instant(), null);
             lastPing.put(name, r);
             return Mono.just(r);
         }

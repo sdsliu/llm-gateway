@@ -4,6 +4,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.TimeoutException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -35,6 +36,12 @@ public class OpenAiCompatibleProvider implements LlmProvider {
 
     private static final Logger log = LoggerFactory.getLogger(OpenAiCompatibleProvider.class);
 
+    /**
+     * Если в конфиге таймаут не задан. 30 с — короче типичного клиентского read-timeout (~120 с у Nori),
+     * чтобы группа моделей успела сделать failover.
+     */
+    static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(30);
+
     private final WebClient webClient;
     private final ProviderProperties props;
     private final Duration timeout;
@@ -49,7 +56,7 @@ public class OpenAiCompatibleProvider implements LlmProvider {
     public OpenAiCompatibleProvider(WebClient.Builder builder, ProviderProperties props, Clock clock) {
         this.props = props;
         this.clock = clock;
-        this.timeout = props.timeout() != null ? props.timeout() : Duration.ofSeconds(120);
+        this.timeout = props.timeout() != null ? props.timeout() : DEFAULT_TIMEOUT;
         this.state = new ProviderState(props.limits());
         this.requestsHeaderPerDay = ru.akiev.gateway.limits.ProbeKind.of(props).requestsHeaderIsPerDay();
         // WebClient неизменяемый и потокобезопасный: создаём один раз и переиспользуем.
@@ -86,15 +93,59 @@ public class OpenAiCompatibleProvider implements LlmProvider {
     }
 
     @Override
-    public ChatResponse chat(ChatRequest request) {
-        // Override модели: клиент может прислать любое имя (например "openai/coder" от Aider),
-        // а провайдеру уходит реальная модель из конфигурации.
-        ChatRequest outgoing = request.withoutStream();
-        if (props.model() != null && !props.model().isBlank()
-                && (request.model() == null || !props.models().contains(request.model()))) {
-            // Модель из списка models уходит как есть, всё остальное заменяем на основную модель провайдера.
-            outgoing = outgoing.withModel(props.model());
+    public Integer maxConcurrency() {
+        return props.maxConcurrency();
+    }
+
+    /** Таймаут этого провайдера (из конфига или {@link #DEFAULT_TIMEOUT}). */
+    Duration requestTimeout() {
+        return timeout;
+    }
+
+    /**
+     * Модель из конфигурации ({@code model} или список {@code models}, включая id из группы) уходит как есть.
+     * Любое другое имя клиента (и пустое) заменяется на основную модель провайдера.
+     * Участник группы ({@code exactModel}) отправляет model из запроса как есть — роутер уже подставил id участника.
+     */
+    private ChatRequest applyConfiguredModel(ChatRequest request, boolean exactModel) {
+        if (exactModel && request.model() != null && !request.model().isBlank()) {
+            return request;
         }
+        if (props.model() == null || props.model().isBlank()) {
+            return request;
+        }
+        String requested = request.model();
+        if (requested != null && props.allModels().contains(requested)) {
+            return request;
+        }
+        return request.withModel(props.model());
+    }
+
+    private Object requestBody(ChatRequest outgoing, boolean exactModel) {
+        return ProviderRequestBody.of(outgoing, props.fallbackModels(), props.extraBody(), exactModel,
+                exactModel && openRouter());
+    }
+
+    /** OpenRouter по имени или по хосту: только ему можно слать provider.allow_fallbacks. */
+    private boolean openRouter() {
+        if (props.name() != null && props.name().equalsIgnoreCase("openrouter")) {
+            return true;
+        }
+        String url = props.baseUrl();
+        return url != null && url.toLowerCase(Locale.ROOT).contains("openrouter.ai");
+    }
+
+    @Override
+    public ChatResponse chat(ChatRequest request) {
+        return chat(request, false);
+    }
+
+    @Override
+    public ChatResponse chat(ChatRequest request, boolean exactModel) {
+        // Override модели: клиент может прислать любое имя (например "openai/coder" от Aider),
+        // а провайдеру уходит реальная модель из конфигурации — либо id, который роутер уже
+        // подставил из группы моделей. exactModel — ровно id участника, без fallback-моделей.
+        ChatRequest outgoing = applyConfiguredModel(request.withoutStream(), exactModel);
         state.recordRequest(clock.instant());
 
         try {
@@ -102,7 +153,7 @@ public class OpenAiCompatibleProvider implements LlmProvider {
                     .uri("/chat/completions")
                     .accept(MediaType.APPLICATION_JSON)
                     // bodyValue: объект сериализуется в JSON через Jackson.
-                    .bodyValue(ProviderRequestBody.of(outgoing, props.fallbackModels(), props.extraBody()))
+                    .bodyValue(requestBody(outgoing, exactModel))
                     // retrieve() — «простой» способ получить ответ. Важно: на 4xx/5xx
                     // retrieve() по умолчанию превращает ответ в ошибку
                     // WebClientResponseException (а не возвращает тело как успешное).
@@ -118,7 +169,8 @@ public class OpenAiCompatibleProvider implements LlmProvider {
                     .toEntity(ChatResponse.class)
                     // timeout(...) — оператор конвейера: если значение не пришло за указанное
                     // время, Mono завершится ошибкой TimeoutException, а HTTP-запрос будет
-                    // отменён. LLM бывают медленными, поэтому по умолчанию 120 секунд.
+                    // отменён. По умолчанию 30 секунд — короче клиентского таймаута, чтобы группа
+                    // успела переключиться на следующего провайдера.
                     .timeout(timeout)
                     // block() — подписывается на Mono и БЛОКИРУЕТ текущий поток, пока не
                     // придёт результат или ошибка. В MVP это нормально: контроллер у нас
@@ -137,7 +189,7 @@ public class OpenAiCompatibleProvider implements LlmProvider {
         } catch (WebClientResponseException e) {
             // Ошибка HTTP от провайдера. Заголовки лимитов приходят и в ответе 429 — читаем их тоже.
             updateLimits(e.getHeaders());
-            Duration retryAfter = RateLimitHeaders.retryAfter(e.getHeaders(), clock.instant());
+            Duration retryAfter = retryAfter(e.getHeaders());
             throw new ProviderException(e.getStatusCode().value(),
                     "Provider " + name() + " returned " + e.getStatusCode().value() + ": "
                             + e.getResponseBodyAsString(), retryAfter, e);
@@ -172,20 +224,19 @@ public class OpenAiCompatibleProvider implements LlmProvider {
      */
     @Override
     public Flux<String> chatStream(ChatRequest request) {
-        ChatRequest outgoing = request.withStream(props.streamUsage());
-        if (props.model() != null && !props.model().isBlank()
-                && (request.model() == null || !props.models().contains(request.model()))) {
-            // Модель из списка models уходит как есть, всё остальное заменяем на основную модель провайдера.
-            outgoing = outgoing.withModel(props.model());
-        }
-        ChatRequest body = outgoing;
+        return chatStream(request, false);
+    }
+
+    @Override
+    public Flux<String> chatStream(ChatRequest request, boolean exactModel) {
+        ChatRequest body = applyConfiguredModel(request, exactModel).withStream(props.streamUsage());
         // Flux.defer — ничего не делаем до подписки (в том числе не считаем запрос в лимитах).
         return Flux.defer(() -> {
             state.recordRequest(clock.instant());
             return webClient.post()
                     .uri("/chat/completions")
                     .accept(MediaType.TEXT_EVENT_STREAM)
-                    .bodyValue(ProviderRequestBody.of(body, props.fallbackModels(), props.extraBody()))
+                    .bodyValue(requestBody(body, exactModel))
                     .retrieve()
                     // toEntityFlux: Mono<ResponseEntity<Flux<T>>> — сначала приходят статус и
                     // заголовки (читаем x-ratelimit-*), а тело остаётся потоком.
@@ -211,7 +262,7 @@ public class OpenAiCompatibleProvider implements LlmProvider {
             return new ProviderException(w.getStatusCode().value(),
                     "Provider " + name() + " returned " + w.getStatusCode().value() + ": "
                             + w.getResponseBodyAsString(),
-                    RateLimitHeaders.retryAfter(w.getHeaders(), clock.instant()), w);
+                    retryAfter(w.getHeaders()), w);
         }
         if (hasCause(e, TimeoutException.class)) {
             return new ProviderException(504, "Provider " + name() + " stream timed out after " + timeout, e);
@@ -252,6 +303,23 @@ public class OpenAiCompatibleProvider implements LlmProvider {
             state.cooldown(now.plus(wait), "remaining requests = 0");
             log.warn("Провайдер {}: лимит запросов исчерпан, пауза {}", name(), wait);
         }
+    }
+
+    /**
+     * Сколько ждать перед повтором: заголовок Retry-After, иначе x-ratelimit-reset-* / ratelimit-reset.
+     * 0 и отрицательные не считаются — роутер подставит default-cooldown.
+     */
+    private Duration retryAfter(HttpHeaders headers) {
+        Instant now = clock.instant();
+        Duration retry = RateLimitHeaders.retryAfter(headers, now);
+        if (retry != null && retry.compareTo(Duration.ZERO) > 0) {
+            return retry;
+        }
+        Duration reset = RateLimitHeaders.resetRequests(headers, now);
+        if (reset != null && reset.compareTo(Duration.ZERO) > 0) {
+            return reset;
+        }
+        return null;
     }
 
     private static boolean hasCause(Throwable t, Class<? extends Throwable> type) {

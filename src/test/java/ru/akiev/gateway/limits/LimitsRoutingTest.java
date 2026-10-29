@@ -189,7 +189,8 @@ class LimitsRoutingTest {
         assertThat(a.state().budget().minuteTokens(clock.instant())).isZero();
         a.failWith = 0;
         assertThat(r.chat(req("x", 10)).id()).isEqualTo("b");
-        // успешный ping (LimitDiscoveryService) снимает паузу — провайдер сразу снова первый
+        // include() (ручной сброс) снимает паузу — провайдер сразу снова первый.
+        // Успешный ping этого больше не делает: пауза живёт до Retry-After.
         a.state().include();
         assertThat(r.chat(req("x", 10)).id()).isEqualTo("a");
     }

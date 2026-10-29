@@ -136,22 +136,30 @@ class LimitDiscoveryServiceTest {
     }
 
     @Test
-    void providerPausedBy429IsReincludedByFirstSuccessfulPing() throws Exception {
+    void successfulPingDoesNotClearActive429Pause() throws Exception {
         good.enqueue(new MockResponse().setBody("{}"));
         var s = service(List.of(props("p", good, 1, "models", "m")));
         s.afterSingletonsInstantiated();
         LlmProvider p = byName(s, "p");
         java.time.Instant now = java.time.Instant.now();
-        // пауза от 429 началась минуту назад и по Retry-After продлилась бы ещё час
+        // SambaNova: GET /models = 200, а chat всё ещё 429 до Retry-After. Ping паузу не снимает.
         p.state().pauseAfter429(now.minusSeconds(60), now.plusSeconds(3600), "HTTP 429");
         assertThat(p.state().isAvailable(now)).isFalse();
-        good.enqueue(new MockResponse().setResponseCode(429));
-        s.reprobe();
-        assertThat(p.state().excluded()).isTrue(); // ping тоже 429 — исключён до следующего перепинга
         good.enqueue(new MockResponse().setBody("{}"));
         s.reprobe();
         assertThat(p.state().excluded()).isFalse();
-        assertThat(p.state().isAvailable(java.time.Instant.now())).isTrue();
+        assertThat(p.state().isAvailable(java.time.Instant.now())).isFalse();
+        assertThat(p.state().cooldownUntil()).isAfter(now.plusSeconds(3000));
+
+        // ping тоже 429 — провайдер исключён, но часовая пауза после успешного ping остаётся
+        good.enqueue(new MockResponse().setResponseCode(429));
+        s.reprobe();
+        assertThat(p.state().excluded()).isTrue();
+        good.enqueue(new MockResponse().setBody("{}"));
+        s.reprobe();
+        assertThat(p.state().excluded()).isFalse();
+        assertThat(p.state().isAvailable(java.time.Instant.now())).isFalse();
+        assertThat(p.state().cooldownReason()).isEqualTo("HTTP 429");
     }
 
     @Test

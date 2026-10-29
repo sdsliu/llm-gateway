@@ -6,6 +6,10 @@ import jakarta.servlet.http.HttpServletResponse;
 import jakarta.validation.Valid;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.MediaType;
@@ -104,9 +108,23 @@ public class ChatController {
 
     @GetMapping("/models")
     public ModelList models() {
-        return ModelList.of(router.providers().stream()
+        List<ModelInfo> data = new ArrayList<>();
+        Set<String> ids = new HashSet<>();
+        router.providers().stream()
                 .flatMap(p -> p.models().stream().map(m -> ModelInfo.of(m, p.name())))
                 .distinct()
-                .toList());
+                .forEach(info -> {
+                    data.add(info);
+                    ids.add(info.id());
+                });
+        List<String> logical = router.logicalModels();
+        if (logical != null) {
+            for (String id : logical) {
+                if (id != null && ids.add(id)) {
+                    data.add(ModelInfo.of(id, "gateway"));
+                }
+            }
+        }
+        return ModelList.of(data);
     }
 }

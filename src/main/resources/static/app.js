@@ -154,6 +154,7 @@ function optState(o) {
   if (!o) return '';
   switch (o.state) {
     case 'no_key': return 'нет ключа';
+    case 'invalid': return o.reason || 'невалидная конфигурация';
     case 'excluded': return 'исключён (не отвечает)';
     case 'limit': return `лимит исчерпан до ${hhmm(o.until)}`;
     case 'cooldown':

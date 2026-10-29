@@ -1,6 +1,7 @@
 package ru.akiev.gateway.config;
 
 import java.time.Clock;
+import java.util.ArrayList;
 import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -28,28 +29,36 @@ public class ProviderConfig {
 
     /**
      * Создаём по провайдеру на каждый элемент gateway.providers, у которого задан ключ
-     * (или ключ необязателен: api-key-optional: true).
+     * (или ключ необязателен: api-key-optional: true) и корректный base-url.
+     * Пустой ключ, битый URL (пустой сегмент пути — не задан account id) — провайдер отключается с WARN.
      * WebClient.Builder Spring Boot создаёт сам (с настроенным Jackson), провайдер делает clone().
      */
     @Bean
     public ProviderRouter providerRouter(WebClient.Builder builder, GatewayProperties props, Clock clock,
             UsageService usageService, RoutingProperties routing, LimitsProperties limits) {
-        List<LlmProvider> providers = props.providers().stream()
-                .filter(p -> {
-                    if (!p.enabled()) {
-                        log.warn("Провайдер {} пропущен: api-key пустой", p.name());
-                    } else if (!p.hasApiKey()) {
-                        log.info("Провайдер {}: api-key не задан, работаем без ключа (keyless)", p.name());
-                    }
-                    return p.enabled();
-                })
+        List<ProviderProperties> usable = new ArrayList<>();
+        for (ProviderProperties p : props.providers()) {
+            String why = p.disabledReason();
+            if (why != null) {
+                log.warn("Провайдер {} отключён: {}", p.name(), why);
+                continue;
+            }
+            if (!p.hasApiKey()) {
+                log.info("Провайдер {}: api-key не задан, работаем без ключа (keyless)", p.name());
+            }
+            usable.add(p);
+        }
+        ModelGroups groups = ModelGroups.compile(props.modelGroups(),
+                usable.stream().map(ProviderProperties::name).toList());
+        List<LlmProvider> providers = usable.stream()
+                .map(p -> p.withExtraModels(groups.extraModels(p.name())))
                 .map(p -> (LlmProvider) new OpenAiCompatibleProvider(builder, p, clock))
                 .toList();
         if (providers.isEmpty()) {
             log.warn("Нет ни одного включённого провайдера — все запросы будут получать 503");
         }
         ProviderRouter router = new ProviderRouter(providers, props.defaultCooldown(), clock, usageService,
-                limits, ProviderRouter.Sleeper.THREAD);
+                limits, ProviderRouter.Sleeper.THREAD, groups, props.modelUnavailableCooldown());
         router.setRouting(initialRouting(props, routing, router));
         log.info("Режим роутинга при старте: {}", router.routing());
         return router;
@@ -65,12 +74,15 @@ public class ProviderConfig {
         if (s.primary() == null || router.names().contains(s.primary())) {
             return s;
         }
-        boolean configured = props.providers().stream().anyMatch(p -> p.name().equals(s.primary()));
-        if (!configured) {
+        ProviderProperties configured = props.providers().stream()
+                .filter(p -> p.name().equals(s.primary())).findFirst().orElse(null);
+        if (configured == null) {
             throw new IllegalStateException("gateway.routing.primary=" + s.primary()
                     + ": такого провайдера нет в gateway.providers");
         }
-        log.warn("gateway.routing.primary={} пропущен: у провайдера нет api-key", s.primary());
+        String why = configured.disabledReason();
+        log.warn("gateway.routing.primary={} пропущен: {}", s.primary(),
+                why != null ? why : "провайдер не включён");
         return new RoutingSettings(s.mode(), null);
     }
 }
