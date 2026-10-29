@@ -1,24 +1,23 @@
 package ru.akiev.gateway.status;
 
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 import org.springframework.http.HttpStatus;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.server.ResponseStatusException;
 import ru.akiev.gateway.api.ChatController;
+import ru.akiev.gateway.api.generated.api.ProvidersApi;
+import ru.akiev.gateway.api.generated.model.AllModels;
 import ru.akiev.gateway.status.ProviderHealthService.ModelsCache;
 import ru.akiev.gateway.status.ProviderHealthService.PingResult;
 
-/** Ping провайдеров и списки моделей для дашборда. */
+/**
+ * Ping провайдеров и списки моделей для дашборда.
+ * API first: пути/параметры — из сгенерированного {@link ProvidersApi}, ответ /status/models — сгенерированный
+ * {@link AllModels} (раньше был {@code Map<String,Object>} с теми же ключами gateway и providers).
+ */
 @RestController
-@RequestMapping("/status")
-public class ProviderHealthController {
+public class ProviderHealthController implements ProvidersApi {
 
     private final ProviderHealthService health;
     private final ChatController chat;
@@ -30,34 +29,33 @@ public class ProviderHealthController {
         this.broadcaster = broadcaster;
     }
 
-    @PostMapping("/providers/{name}/ping")
-    public PingResult ping(@PathVariable String name) {
+    @Override
+    public ResponseEntity<PingResult> pingProvider(String name) {
         check(name);
         PingResult r = health.ping(name);
         broadcaster.broadcastSnapshot();
-        return r;
+        return ResponseEntity.ok(r);
     }
 
-    @PostMapping("/providers/ping")
-    public List<PingResult> pingAll() {
+    @Override
+    public ResponseEntity<List<PingResult>> pingAllProviders() {
         List<PingResult> r = health.pingAll();
         broadcaster.broadcastSnapshot();
-        return r;
+        return ResponseEntity.ok(r);
     }
 
-    @GetMapping("/providers/{name}/models")
-    public ModelsCache models(@PathVariable String name, @RequestParam(defaultValue = "false") boolean refresh) {
+    @Override
+    public ResponseEntity<ModelsCache> getProviderModels(String name, Boolean refresh) {
         check(name);
-        return health.models(name, refresh);
+        return ResponseEntity.ok(health.models(name, Boolean.TRUE.equals(refresh)));
     }
 
     /** gateway — то, что отдаёт /v1/models; providers — реальные /models каждого провайдера (кэш). */
-    @GetMapping("/models")
-    public Map<String, Object> allModels(@RequestParam(defaultValue = "false") boolean refresh) {
-        Map<String, Object> m = new LinkedHashMap<>();
-        m.put("gateway", chat.models().data());
-        m.put("providers", health.allModels(refresh));
-        return m;
+    @Override
+    public ResponseEntity<AllModels> getAllModels(Boolean refresh) {
+        return ResponseEntity.ok(new AllModels()
+                .gateway(chat.models())
+                .providers(health.allModels(Boolean.TRUE.equals(refresh))));
     }
 
     private void check(String name) {

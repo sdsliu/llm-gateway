@@ -1,13 +1,10 @@
 package ru.akiev.gateway.status;
 
 import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.DeleteMapping;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PutMapping;
-import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
-import ru.akiev.gateway.dto.ErrorResponse;
+import ru.akiev.gateway.api.InvalidRequestException;
+import ru.akiev.gateway.api.generated.api.RoutingApi;
+import ru.akiev.gateway.api.generated.model.RoutingUpdate;
 import ru.akiev.gateway.router.RoutingMode;
 import ru.akiev.gateway.router.RoutingSettings;
 
@@ -16,14 +13,12 @@ import ru.akiev.gateway.router.RoutingSettings;
  * рестарт; DELETE удаляет сохранённое и возвращает gateway.routing из application.yml.
  * Как и остальной /status, эндпоинт без авторизации: шлюз рассчитан на локальный запуск,
  * наружу порт не публикуем.
+ *
+ * <p><b>API first:</b> пути и методы приходят из сгенерированного {@link RoutingApi}; тело PUT —
+ * сгенерированный {@link RoutingUpdate} (mode обязателен по смыслу; primary пустой/null — без primary).
  */
 @RestController
-@RequestMapping("/status/routing")
-public class RoutingController {
-
-    /** Тело PUT: mode обязателен; primary пустой/null — без primary. */
-    public record RoutingUpdate(String mode, String primary) {
-    }
+public class RoutingController implements RoutingApi {
 
     private final RoutingSettingsService settings;
     private final StatusService statusService;
@@ -36,21 +31,27 @@ public class RoutingController {
         this.broadcaster = broadcaster;
     }
 
-    @GetMapping
-    public RoutingInfo get() {
-        return statusService.routing();
+    @Override
+    public ResponseEntity<RoutingInfo> getRouting() {
+        return ResponseEntity.ok(statusService.routing());
     }
 
-    @PutMapping
-    public ResponseEntity<?> put(@RequestBody RoutingUpdate body) {
-        RoutingMode mode = RoutingMode.parse(body.mode());
+    /**
+     * Интерфейс требует тип ответа {@code ResponseEntity<RoutingInfo>}, поэтому ошибку 400 нельзя вернуть
+     * телом прямо отсюда (раньше было {@code ResponseEntity<?>}). Бросаем {@link InvalidRequestException} —
+     * ApiExceptionHandler превращает его в тот же самый ответ: 400 и
+     * {@code {"error":{"message":..., "type":"invalid_request_error"}}}.
+     */
+    @Override
+    public ResponseEntity<RoutingInfo> updateRouting(RoutingUpdate body) {
+        RoutingMode mode = RoutingMode.parse(body.getMode());
         if (mode == null) {
-            return bad("mode must be one of PRIORITY, ROUND_ROBIN, HEADROOM (got: " + body.mode() + ")");
+            throw new InvalidRequestException("mode must be one of PRIORITY, ROUND_ROBIN, HEADROOM (got: " + body.getMode() + ")");
         }
         try {
-            settings.update(new RoutingSettings(mode, body.primary()));
+            settings.update(new RoutingSettings(mode, body.getPrimary()));
         } catch (IllegalArgumentException e) {
-            return bad(e.getMessage());
+            throw new InvalidRequestException(e.getMessage());
         }
         // Все открытые дашборды сразу видят новый режим через SSE.
         broadcaster.broadcastSnapshot();
@@ -58,14 +59,10 @@ public class RoutingController {
     }
 
     /** «Сбросить к настройкам из конфига»: удалить сохранённое в БД, вернуть gateway.routing. */
-    @DeleteMapping
-    public RoutingInfo reset() {
+    @Override
+    public ResponseEntity<RoutingInfo> resetRouting() {
         settings.reset();
         broadcaster.broadcastSnapshot();
-        return statusService.routing();
-    }
-
-    private static ResponseEntity<ErrorResponse> bad(String msg) {
-        return ResponseEntity.badRequest().body(ErrorResponse.of(msg, "invalid_request_error", null));
+        return ResponseEntity.ok(statusService.routing());
     }
 }

@@ -23,6 +23,12 @@ public class ApiExceptionHandler {
         return ResponseEntity.badRequest().body(ErrorResponse.of(msg, "invalid_request_error", null));
     }
 
+    /** Ошибка проверки в контроллере (например неизвестный mode в PUT /status/routing). */
+    @ExceptionHandler(InvalidRequestException.class)
+    public ResponseEntity<ErrorResponse> invalid(InvalidRequestException e) {
+        return ResponseEntity.badRequest().body(ErrorResponse.of(e.getMessage(), "invalid_request_error", null));
+    }
+
     @ExceptionHandler(HttpMessageNotReadableException.class)
     public ResponseEntity<ErrorResponse> unreadable(HttpMessageNotReadableException e) {
         return ResponseEntity.badRequest()

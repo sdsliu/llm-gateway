@@ -14,6 +14,10 @@
   <name>llm-gateway</name>
   <properties>
     <java.version>21</java.version>
+    <!-- API first: версия генератора кода из OpenAPI-контракта и Swagger UI -->
+    <openapi-generator.version>7.26.0</openapi-generator.version>
+    <!-- 2.6.x — линейка springdoc для Spring Boot 3.3 (2.7+ требует Boot 3.4 / Spring 6.2) -->
+    <springdoc.version>2.6.0</springdoc.version>
   </properties>
   <dependencies>
     <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-web</artifactId></dependency>
@@ -24,6 +28,8 @@
     <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-data-jpa</artifactId></dependency>
     <dependency><groupId>org.flywaydb</groupId><artifactId>flyway-core</artifactId></dependency>
     <dependency><groupId>org.flywaydb</groupId><artifactId>flyway-database-postgresql</artifactId></dependency>
+    <!-- Swagger UI по адресу /swagger-ui.html; показывает контракт src/main/resources/openapi/llm-gateway.yaml -->
+    <dependency><groupId>org.springdoc</groupId><artifactId>springdoc-openapi-starter-webmvc-ui</artifactId><version>${springdoc.version}</version></dependency>
     <dependency><groupId>org.postgresql</groupId><artifactId>postgresql</artifactId><scope>runtime</scope></dependency>
     <dependency><groupId>com.h2database</groupId><artifactId>h2</artifactId><scope>test</scope></dependency>
     <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-test</artifactId><scope>test</scope></dependency>
@@ -38,6 +44,76 @@
   <build>
     <plugins>
       <plugin><groupId>org.springframework.boot</groupId><artifactId>spring-boot-maven-plugin</artifactId></plugin>
+      <!--
+        API first: при каждой сборке (фаза generate-sources) генерируем из контракта Java-интерфейсы
+        контроллеров и часть DTO в target/generated-sources/openapi. В git сгенерированный код НЕ кладём:
+        источник правды — YAML, код из него всегда воспроизводится. Контроллеры реализуют интерфейсы
+        (implements ...Api), поэтому расхождение сигнатур с контрактом ломает компиляцию.
+      -->
+      <plugin>
+        <groupId>org.openapitools</groupId>
+        <artifactId>openapi-generator-maven-plugin</artifactId>
+        <version>${openapi-generator.version}</version>
+        <executions>
+          <execution>
+            <id>llm-gateway-server</id>
+            <goals><goal>generate</goal></goals>
+            <configuration>
+              <inputSpec>${project.basedir}/src/main/resources/openapi/llm-gateway.yaml</inputSpec>
+              <generatorName>spring</generatorName>
+              <library>spring-boot</library>
+              <apiPackage>ru.akiev.gateway.api.generated.api</apiPackage>
+              <modelPackage>ru.akiev.gateway.api.generated.model</modelPackage>
+              <!-- Только интерфейсы и модели: без Application, pom, README, ApiUtil и т.п. -->
+              <generateSupportingFiles>false</generateSupportingFiles>
+              <generateApiTests>false</generateApiTests>
+              <generateModelTests>false</generateModelTests>
+              <generateApiDocumentation>false</generateApiDocumentation>
+              <generateModelDocumentation>false</generateModelDocumentation>
+              <!--
+                Какие модели генерировать. Остальные схемы контракта сопоставлены существующим Java-record'ам
+                (schemaMappings ниже): они уже дают ровно тот JSON, что описан в контракте (snake_case,
+                @JsonInclude для primary, Instant, enum'ы с @JsonValue), и используются внутри шлюза
+                (роутер, SSE, статистика). Дублировать их сгенерированными классами + писать мапперы —
+                больше кода и новый источник расхождений. Соответствие record'ов контракту проверяет
+                тест ContractSchemaTest.
+              -->
+              <modelsToGenerate>RoutingUpdate,ModelInfo,ModelList,AllModels,SpringError</modelsToGenerate>
+              <schemaMappings>
+                StatusSnapshot=ru.akiev.gateway.status.StatusSnapshot,
+                RoutingInfo=ru.akiev.gateway.status.RoutingInfo,
+                PingResult=ru.akiev.gateway.status.ProviderHealthService.PingResult,
+                ModelsCache=ru.akiev.gateway.status.ProviderHealthService.ModelsCache,
+                RunStats=ru.akiev.gateway.stats.RunStats,
+                EfficiencyReport=ru.akiev.gateway.stats.EfficiencyMerger.Report,
+                ChatRequest=ru.akiev.gateway.dto.ChatRequest,
+                ChatResponse=ru.akiev.gateway.dto.ChatResponse,
+                ErrorResponse=ru.akiev.gateway.dto.ErrorResponse
+              </schemaMappings>
+              <configOptions>
+                <!-- Только интерфейсы: реализацию пишем сами в контроллерах -->
+                <interfaceOnly>true</interfaceOnly>
+                <!-- Без default-методов «501 Not Implemented»: забытый метод = ошибка компиляции -->
+                <skipDefaultInterface>true</skipDefaultInterface>
+                <!-- Один интерфейс на тег контракта: OpenaiApi, StatusApi, RoutingApi, ProvidersApi, StatsApi -->
+                <useTags>true</useTags>
+                <useSpringBoot3>true</useSpringBoot3>
+                <useJakartaEe>true</useJakartaEe>
+                <!-- Аннотации jakarta.validation (@Valid, @NotNull...) в интерфейсах и моделях -->
+                <useBeanValidation>true</useBeanValidation>
+                <!-- jackson-databind-nullable не нужен: null-поля и так опускаются (default-property-inclusion: non_null) -->
+                <openApiNullable>false</openApiNullable>
+                <!-- Без swagger-annotations в сгенерированном коде: документация — сам YAML -->
+                <documentationProvider>none</documentationProvider>
+                <annotationLibrary>none</annotationLibrary>
+                <useResponseEntity>true</useResponseEntity>
+                <hideGenerationTimestamp>true</hideGenerationTimestamp>
+                <sourceFolder>src/main/java</sourceFolder>
+              </configOptions>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
       <!-- ./mvnw test   — быстрые unit/slice-тесты на H2 (surefire, *Test).
            ./mvnw verify — плюс интеграционные *IT на Testcontainers (failsafe, нужен Docker). -->
       <plugin>

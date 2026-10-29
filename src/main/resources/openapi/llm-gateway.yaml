@@ -1,0 +1,1126 @@
+openapi: 3.0.3
+info:
+  title: llm-gateway API
+  version: "0.1.0"
+  description: |
+    OpenAI-совместимый LLM-шлюз (прокси) с failover между провайдерами, учётом лимитов,
+    дашбордом статуса и статистикой прогонов. 
+    **API first:** этот файл — единственный источник правды об HTTP API. Из него при сборке
+    (`./mvnw generate-sources`) openapi-generator создаёт Java-интерфейсы контроллеров
+    (`ru.akiev.gateway.api.generated.api`) и часть DTO (`ru.akiev.gateway.api.generated.model`).
+    Swagger UI с этим контрактом: `/swagger-ui.html`; сам файл отдаётся по `/openapi/llm-gateway.yaml`.
+
+    Технически это Spring Boot на Spring MVC (сервлеты: `SseEmitter`, `StreamingResponseBody`);
+    WebFlux `WebClient` используется только для исходящих запросов к провайдерам.
+
+    **Авторизация.** Входящие запросы шлюз не проверяет: заголовок `Authorization: Bearer ...`
+    (его шлют OpenAI SDK / Aider) принимается, но игнорируется. Ключи провайдеров берутся из конфига
+    шлюза. `/status/**` и `/stats/**` тоже без авторизации — шлюз рассчитан на локальный запуск.
+
+    **Ошибки** `/v1/*` и `/status/routing` (PUT) — в формате OpenAI: `{"error": {"message", "type", "code"}}`.
+    Ошибки из `ResponseStatusException` (404 у `/status/providers/{name}/*`, 400 у `/stats/runs`)
+    возвращаются стандартным телом ошибки Spring Boot (`timestamp`, `status`, `error`, `path`, ...).
+
+    **Статические страницы** (не API, отдаются из `classpath:/static`):
+    - `/` (`index.html`, `app.js`, `style.css`) — дашборд состояния провайдеров (читает `/status/stream`, управляет `/status/routing`);
+    - `/efficiency.html` (`efficiency.js`) — таблица «Эффективность» (читает `/stats/efficiency`).
+servers:
+  - url: http://localhost:4000
+    description: Локальный запуск (server.port = 4000)
+tags:
+  - name: openai
+    description: OpenAI-совместимые эндпоинты
+  - name: status
+    description: Состояние шлюза и провайдеров (дашборд)
+  - name: routing
+    description: Режим роутинга (сохраняется в БД, таблица routing_settings)
+  - name: providers
+    description: Ping провайдеров и списки моделей
+  - name: stats
+    description: Статистика по прогонам / issue / клиентам
+
+paths:
+  /v1/chat/completions:
+    post:
+      tags: [openai]
+      operationId: createChatCompletion
+      # x-internal: true — openapi-generator НЕ генерирует для этой операции метод интерфейса.
+      # Операция потоковая (text/event-stream), реализована вручную в контроллере; см. README «API first».
+      x-internal: true
+      summary: Chat completion (OpenAI-совместимый)
+      description: |
+        Запрос уходит первому доступному провайдеру согласно режиму роутинга (с учётом лимитов RPM/RPD/TPM/
+        суточных/месячных квот и размера запроса); при 429/5xx/таймауте — пауза провайдера и failover на следующего.
+        Если места нет ни у кого — запрос ждёт до `gateway.limits.max-wait`, затем 429. Неизвестные поля тела игнорируются.
+
+        `stream: false` (или отсутствует) → JSON `ChatResponse`.
+        `stream: true` → `text/event-stream` в формате OpenAI: `data: {chunk-json}\n\n` на каждый чанк
+        и `data: [DONE]\n\n` в конце. Failover происходит до начала ответа; если все провайдеры недоступны —
+        обычный JSON 503. Если стрим оборвался посреди ответа (статус уже 200), шлюз шлёт error-чанк
+        `data: {"error": {...}}` и затем `data: [DONE]`. Заголовки стрима: `Cache-Control: no-cache`,
+        `X-Accel-Buffering: no`.
+
+        Заголовки `x-run-id`, `x-issue`, `x-client` и поле `user` сохраняются как метки в usage_record
+        (используются в `/stats/*`).
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+        - $ref: '#/components/parameters/Issue'
+        - $ref: '#/components/parameters/Client'
+        - $ref: '#/components/parameters/Authorization'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatRequest'
+            examples:
+              simple:
+                value:
+                  model: gpt-oss-120b
+                  messages:
+                    - role: user
+                      content: Привет!
+              streaming:
+                value:
+                  model: gpt-oss-120b
+                  stream: true
+                  stream_options:
+                    include_usage: true
+                  messages:
+                    - role: user
+                      content: Привет!
+      responses:
+        '200':
+          description: |
+            Успех. JSON при `stream != true`, SSE-поток при `stream: true`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatResponse'
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  Последовательность событий `data: <json-чанк провайдера в формате OpenAI chat.completion.chunk>`,
+                  завершающаяся `data: [DONE]`. Чанки пробрасываются от провайдера как есть (шлюз их не
+                  типизирует). usage-чанк пересылается клиенту, только если он запросил
+                  `stream_options.include_usage: true`. При обрыве — чанк `ErrorResponse`.
+              example: |
+                data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"При"}}]}
+
+                data: [DONE]
+        '400':
+          description: |
+            Невалидный запрос: `messages` пуст / у сообщения пустой `role` (сообщение вида `field: reason; ...`)
+            или битый JSON (`Malformed JSON body`). `type = invalid_request_error`, `code = null`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '413':
+          description: Запрос больше лимитов всех доступных провайдеров. `type = code = request_too_large`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          description: |
+            Места нет ни у одного подходящего провайдера (RPM/RPD/TPM/суточные/месячные лимиты) и за
+            `gateway.limits.max-wait` не освободилось. `type = code = rate_limit_exceeded`.
+          headers:
+            Retry-After:
+              description: Через сколько секунд стоит повторить (округление вверх, минимум 1).
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Все провайдеры недоступны (cooldown/лимит/ошибки). `type = service_unavailable`, `code = all_providers_unavailable`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  message: "All providers unavailable: groq: HTTP 429; openrouter: HTTP 503"
+                  type: service_unavailable
+                  code: all_providers_unavailable
+        default:
+          description: |
+            Ошибка провайдера без failover (например 4xx, кроме 429/401/402/403) — статус провайдера
+            пробрасывается как есть: `type = provider_error`, `code` = HTTP-статус строкой.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/models:
+    get:
+      tags: [openai]
+      operationId: listModels
+      summary: Список моделей (OpenAI-совместимый)
+      description: Модели из конфигурации всех провайдеров шлюза (без дублей); `owned_by` — имя провайдера, `created` всегда 0.
+      parameters:
+        - $ref: '#/components/parameters/Authorization'
+      responses:
+        '200':
+          description: Список моделей
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelList'
+
+  /status:
+    get:
+      tags: [status]
+      operationId: getStatus
+      summary: Срез состояния шлюза
+      description: Разовый срез (JSON) — для curl и Telegram-бота. Поля snake_case, стабильны.
+      responses:
+        '200':
+          description: Срез состояния
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusSnapshot'
+
+  /status/stream:
+    get:
+      tags: [status]
+      operationId: streamStatus
+      # x-internal: true — openapi-generator НЕ генерирует для этой операции метод интерфейса.
+      # Операция потоковая (text/event-stream), реализована вручную в контроллере; см. README «API first».
+      x-internal: true
+      summary: Живой поток состояния (SSE)
+      description: |
+        Server-Sent Events для дашборда. События:
+        - `event: snapshot` — `data` = JSON `StatusSnapshot` (сразу при подключении, `retry: 3000`,
+          и далее при каждом новом usage-событии / смене роутинга / ping);
+        - `event: heartbeat` — `data` = текущее время ISO-8601 (keep-alive).
+      responses:
+        '200':
+          description: SSE-поток
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              example: |
+                retry: 3000
+                event: snapshot
+                data: {"generated_at":"2026-10-20T11:00:00Z","providers":[...]}
+
+                event: heartbeat
+                data: 2026-10-20T11:00:15Z
+
+  /status/routing:
+    get:
+      tags: [routing]
+      operationId: getRouting
+      summary: Текущий режим роутинга
+      responses:
+        '200':
+          description: Режим роутинга
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoutingInfo'
+    put:
+      tags: [routing]
+      operationId: updateRouting
+      summary: Изменить режим роутинга
+      description: Сохраняет выбор в БД (переживает рестарт) и рассылает новый snapshot по SSE.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RoutingUpdate'
+            example:
+              mode: PRIORITY
+              primary: groq
+      responses:
+        '200':
+          description: Новый режим роутинга
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoutingInfo'
+        '400':
+          description: |
+            Неизвестный или отсутствующий `mode` (`mode must be one of PRIORITY, ROUND_ROBIN, HEADROOM (got: ...)`) или недопустимый
+            `primary` (сообщение из `IllegalArgumentException`). `type = invalid_request_error`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    delete:
+      tags: [routing]
+      operationId: resetRouting
+      summary: Сбросить к настройкам из конфига
+      description: Удаляет сохранённые в БД настройки — снова действует `gateway.routing` из application.yml.
+      responses:
+        '200':
+          description: Режим роутинга после сброса (`source = CONFIG`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoutingInfo'
+
+  /status/providers/{name}/ping:
+    post:
+      tags: [providers]
+      operationId: pingProvider
+      summary: Ping одного провайдера
+      description: "`GET {base-url}{ping-path}` (по умолчанию `/models`) у провайдера; после — рассылка snapshot по SSE."
+      parameters:
+        - $ref: '#/components/parameters/ProviderName'
+      responses:
+        '200':
+          description: Результат ping
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PingResult'
+        '404':
+          $ref: '#/components/responses/UnknownProvider'
+
+  /status/providers/ping:
+    post:
+      tags: [providers]
+      operationId: pingAllProviders
+      summary: Ping всех провайдеров
+      responses:
+        '200':
+          description: Результаты ping по каждому провайдеру
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PingResult'
+
+  /status/providers/{name}/models:
+    get:
+      tags: [providers]
+      operationId: getProviderModels
+      summary: Реальный список моделей провайдера (кэш /models)
+      parameters:
+        - $ref: '#/components/parameters/ProviderName'
+        - $ref: '#/components/parameters/Refresh'
+      responses:
+        '200':
+          description: Кэш моделей провайдера
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelsCache'
+        '404':
+          $ref: '#/components/responses/UnknownProvider'
+
+  /status/models:
+    get:
+      tags: [providers]
+      operationId: getAllModels
+      summary: Модели шлюза и всех провайдеров
+      description: "`gateway` — то же, что `data` из `/v1/models`; `providers` — реальные `/models` каждого провайдера (кэш)."
+      parameters:
+        - $ref: '#/components/parameters/Refresh'
+      responses:
+        '200':
+          description: Модели шлюза и провайдеров
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AllModels'
+
+  /stats/runs:
+    get:
+      tags: [stats]
+      operationId: getRunStats
+      summary: Агрегаты usage по прогону / issue / клиенту
+      parameters:
+        - name: groupBy
+          in: query
+          description: Поле группировки (`x-run-id`, `x-issue` или `x-client`).
+          schema:
+            type: string
+            enum: [run, issue, client]
+            default: run
+        - $ref: '#/components/parameters/Days'
+        - name: limit
+          in: query
+          description: Максимум групп в ответе (зажимается в 1..1000).
+          schema:
+            type: integer
+            default: 200
+      responses:
+        '200':
+          description: Список агрегатов
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RunStats'
+        '400':
+          description: "Неверный `groupBy` (`groupBy: run | issue | client`), стандартное тело ошибки Spring."
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SpringError'
+
+  /stats/efficiency:
+    get:
+      tags: [stats]
+      operationId: getEfficiency
+      summary: Эффективность прогонов (шлюз + ai-runner)
+      description: |
+        Объединяет статистику шлюза по помеченным `run_id` с данными ai-runner (`GET /stats` spring-runner):
+        статус, попытки, длительность, PR. Прогоны, которых нет у ai-runner, попадают в `other`.
+        Если runner не ответил — `runner_available = false`, поля runner в строках пустые.
+      parameters:
+        - $ref: '#/components/parameters/Days'
+      responses:
+        '200':
+          description: Отчёт
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EfficiencyReport'
+
+components:
+  parameters:
+    RunId:
+      name: x-run-id
+      in: header
+      required: false
+      description: Идентификатор прогона (метка usage_record, до 128 символов, управляющие символы удаляются).
+      schema:
+        type: string
+        maxLength: 128
+    Issue:
+      name: x-issue
+      in: header
+      required: false
+      description: Номер/ключ issue (метка, до 64 символов).
+      schema:
+        type: string
+        maxLength: 64
+    Client:
+      name: x-client
+      in: header
+      required: false
+      description: Имя клиента (метка, до 64 символов), например aider.
+      schema:
+        type: string
+        maxLength: 64
+    Authorization:
+      name: Authorization
+      in: header
+      required: false
+      description: "`Bearer <любой>` — принимается для совместимости с OpenAI SDK, шлюзом не проверяется."
+      schema:
+        type: string
+    ProviderName:
+      name: name
+      in: path
+      required: true
+      description: Имя провайдера из конфига (`gateway.providers[].name`).
+      schema:
+        type: string
+    Refresh:
+      name: refresh
+      in: query
+      required: false
+      description: "`true` — перезапросить `/models` у провайдера вместо кэша."
+      schema:
+        type: boolean
+        default: false
+    Days:
+      name: days
+      in: query
+      required: false
+      description: Окно в днях от текущего момента (зажимается в 1..365).
+      schema:
+        type: integer
+        default: 30
+
+  responses:
+    UnknownProvider:
+      description: "Неизвестный провайдер (`Неизвестный провайдер: {name}`), стандартное тело ошибки Spring."
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/SpringError'
+
+  schemas:
+    ErrorResponse:
+      type: object
+      description: Ошибка в формате OpenAI.
+      properties:
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+            type:
+              type: string
+              description: invalid_request_error | provider_error | service_unavailable | request_too_large | rate_limit_exceeded
+            code:
+              type: string
+              nullable: true
+              description: all_providers_unavailable | request_too_large | rate_limit_exceeded | HTTP-статус провайдера | null
+    SpringError:
+      type: object
+      description: Стандартное тело ошибки Spring Boot (поля зависят от server.error.*).
+      additionalProperties: true
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        status:
+          type: integer
+        error:
+          type: string
+        message:
+          type: string
+        path:
+          type: string
+
+    Message:
+      type: object
+      required: [role]
+      description: Сообщение диалога. Прочие поля игнорируются.
+      properties:
+        role:
+          type: string
+          description: system | user | assistant | tool (не пустая строка)
+        content:
+          type: string
+          nullable: true
+    ChatRequest:
+      type: object
+      required: [messages]
+      description: |
+        Подмножество OpenAI API. Неизвестные поля (tools, response_format, ...) принимаются без 400,
+        но провайдеру НЕ пересылаются — шлюз отправляет только перечисленные здесь поля
+        (плюс `extra-body` провайдера из конфига).
+      additionalProperties: true
+      properties:
+        model:
+          type: string
+          description: Модель; провайдер может подменить её своей (override модели провайдера).
+        messages:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/Message'
+        stream:
+          type: boolean
+          description: "`true` — ответ потоком `text/event-stream`."
+        temperature:
+          type: number
+          format: double
+        top_p:
+          type: number
+          format: double
+        max_tokens:
+          type: integer
+        stop:
+          type: array
+          items:
+            type: string
+        presence_penalty:
+          type: number
+          format: double
+        frequency_penalty:
+          type: number
+          format: double
+        user:
+          type: string
+          description: Пользователь; сохраняется как метка usage_record (до 128 символов).
+        stream_options:
+          type: object
+          properties:
+            include_usage:
+              type: boolean
+              description: Прислать usage последним чанком стрима.
+        reasoning_effort:
+          type: string
+          description: low | medium | high (gpt-oss / o-серии), пробрасывается провайдеру как есть.
+    Usage:
+      type: object
+      properties:
+        prompt_tokens:
+          type: integer
+        completion_tokens:
+          type: integer
+        total_tokens:
+          type: integer
+    Choice:
+      type: object
+      properties:
+        index:
+          type: integer
+        message:
+          $ref: '#/components/schemas/Message'
+        finish_reason:
+          type: string
+    ChatResponse:
+      type: object
+      description: |
+        Ответ chat completion в формате OpenAI (null-поля опускаются). Шлюз разбирает ответ провайдера
+        в этот набор полей: прочие поля провайдера (например tool_calls, system_fingerprint) клиенту не доходят.
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          example: chat.completion
+        created:
+          type: integer
+          format: int64
+        model:
+          type: string
+        choices:
+          type: array
+          items:
+            $ref: '#/components/schemas/Choice'
+        usage:
+          $ref: '#/components/schemas/Usage'
+    ModelInfo:
+      type: object
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          example: model
+        created:
+          type: integer
+          format: int64
+          example: 0
+        owned_by:
+          type: string
+          description: Имя провайдера шлюза
+    AllModels:
+      type: object
+      description: Ответ GET /status/models.
+      properties:
+        gateway:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelInfo'
+        providers:
+          type: object
+          description: Имя провайдера → кэш моделей
+          additionalProperties:
+            $ref: '#/components/schemas/ModelsCache'
+    ModelList:
+      type: object
+      properties:
+        object:
+          type: string
+          example: list
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelInfo'
+
+    RoutingMode:
+      type: string
+      enum: [PRIORITY, ROUND_ROBIN, HEADROOM]
+      description: |
+        PRIORITY — по priority (меньше = раньше), заданный primary идёт первым;
+        ROUND_ROBIN — по кругу среди доступных сейчас, при ошибке — следующий;
+        HEADROOM — к тому, у кого больше запаса по лимитам с учётом размера запроса, при равенстве — по priority.
+    RoutingUpdate:
+      type: object
+      description: |
+        `mode` обязателен по смыслу, но НЕ помечен `required`: проверку делает контроллер (RoutingMode.parse),
+        чтобы сообщение об ошибке осталось прежним (`mode must be one of ...`), а не стандартным от Bean Validation.
+      properties:
+        mode:
+          type: string
+          description: PRIORITY | ROUND_ROBIN | HEADROOM; регистр не важен, `round-robin` = `ROUND_ROBIN`.
+          example: ROUND_ROBIN
+        primary:
+          type: string
+          nullable: true
+          description: Провайдер, идущий первым в PRIORITY; пусто/null — без primary.
+    ProviderOption:
+      type: object
+      description: Провайдер в списке выбора primary с живым состоянием.
+      properties:
+        name:
+          type: string
+        priority:
+          type: integer
+        selectable:
+          type: boolean
+          description: Можно выбрать primary (false — нет api-key; cooldown/лимит выбор не запрещают).
+        state:
+          type: string
+          enum: [healthy, cooldown, limit, excluded, no_key]
+        until:
+          type: string
+          format: date-time
+          description: До какого момента недоступен; отсутствует — доступен.
+        reason:
+          type: string
+          description: Причина cooldown (например «HTTP 429»).
+        keyless:
+          type: boolean
+          description: Работает без ключа (api-key-optional).
+    RoutingInfo:
+      type: object
+      description: Текущий режим роутинга (null-поля, кроме primary, опускаются).
+      properties:
+        mode:
+          $ref: '#/components/schemas/RoutingMode'
+        primary:
+          type: string
+          nullable: true
+          description: Всегда присутствует; null — чистый приоритет.
+        providers:
+          type: array
+          description: Провайдеры, которые можно выбрать primary (включённые), по priority.
+          items:
+            type: string
+        order:
+          type: array
+          description: Порядок перебора для следующего запроса (недоступные остаются — роутер их пропустит).
+          items:
+            type: string
+        options:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProviderOption'
+        source:
+          type: string
+          enum: [CONFIG, DB]
+          description: CONFIG — из application.yml, DB — сохранено с дашборда.
+        warning:
+          type: string
+          description: Сохранённые настройки не удалось применить целиком.
+        config:
+          type: object
+          description: Настройки из конфига — к ним вернёт DELETE /status/routing.
+          properties:
+            mode:
+              $ref: '#/components/schemas/RoutingMode'
+            primary:
+              type: string
+              nullable: true
+
+    PingResult:
+      type: object
+      properties:
+        provider:
+          type: string
+        state:
+          type: string
+          enum: [up, down, skipped]
+        latency_ms:
+          type: integer
+          format: int64
+        http_status:
+          type: integer
+        error:
+          type: string
+        checked_at:
+          type: string
+          format: date-time
+        models_count:
+          type: integer
+    ModelsCache:
+      type: object
+      description: fetched_at — последний успешный ответ /models, checked_at — последняя попытка.
+      properties:
+        models:
+          type: array
+          items:
+            type: string
+        fetched_at:
+          type: string
+          format: date-time
+        error:
+          type: string
+        checked_at:
+          type: string
+          format: date-time
+
+    KeyInfo:
+      type: object
+      description: Данные OpenRouter GET /api/v1/key.
+      properties:
+        data:
+          type: object
+          additionalProperties: true
+          description: Ответ OpenRouter как есть (free-form).
+        fetched_at:
+          type: string
+          format: date-time
+        error:
+          type: string
+    ProviderStatus:
+      type: object
+      properties:
+        name:
+          type: string
+        model:
+          type: string
+        priority:
+          type: integer
+        state:
+          type: string
+          enum: [healthy, cooldown, limit, excluded, skipped]
+          description: skipped — нет api-key; excluded — исключён из роутинга (не ответил на опрос / 429)
+        cooldown_until:
+          type: string
+          format: date-time
+        cooldown_reason:
+          type: string
+        remaining_requests:
+          type: integer
+          format: int64
+        remaining_tokens:
+          type: integer
+          format: int64
+        rpm_used:
+          type: integer
+          format: int64
+        rpm_limit:
+          type: integer
+        rpd_used:
+          type: integer
+          format: int64
+        rpd_limit:
+          type: integer
+        requests_today:
+          type: integer
+          format: int64
+        tokens_today:
+          type: integer
+          format: int64
+        errors_today:
+          type: integer
+          format: int64
+        avg_latency_ms:
+          type: integer
+          format: int64
+        last_error:
+          type: string
+        last_error_at:
+          type: string
+          format: date-time
+        key_info:
+          $ref: '#/components/schemas/KeyInfo'
+        reset_requests_at:
+          type: string
+          format: date-time
+          description: Когда провайдер обещал сбросить лимит запросов (x-ratelimit-reset-*).
+        reset_tokens_at:
+          type: string
+          format: date-time
+        limits_seen_at:
+          type: string
+          format: date-time
+          description: Когда последний раз видели заголовки x-ratelimit-*.
+        last_ping:
+          $ref: '#/components/schemas/PingResult'
+        keyless:
+          type: boolean
+        limits:
+          $ref: '#/components/schemas/LimitsView'
+        excluded:
+          type: boolean
+          description: Исключён из роутинга (не ответил на опрос при старте / перепинге или ответил 429).
+        excluded_reason:
+          type: string
+        excluded_since:
+          type: string
+          format: date-time
+        limits_probe:
+          $ref: '#/components/schemas/ProbeView'
+    LimitUsage:
+      type: object
+      description: Один лимит провайдера.
+      properties:
+        limit:
+          type: integer
+          format: int64
+          description: Значение лимита; отсутствует — не ограничен.
+        used:
+          type: integer
+          format: int64
+          description: Использовано в текущем окне (минута — скользящая, сутки/месяц — по UTC).
+        remaining:
+          type: integer
+          format: int64
+          description: Остаток; отсутствует — без ограничения.
+        source:
+          type: string
+          enum: [api, headers, config]
+          description: Откуда взято значение; отсутствует — лимита нет.
+    LimitsView:
+      type: object
+      description: Все лимиты провайдера.
+      properties:
+        rpm:
+          $ref: '#/components/schemas/LimitUsage'
+        rpd:
+          $ref: '#/components/schemas/LimitUsage'
+        tpm:
+          $ref: '#/components/schemas/LimitUsage'
+        tokens_per_day:
+          $ref: '#/components/schemas/LimitUsage'
+        tokens_per_month:
+          $ref: '#/components/schemas/LimitUsage'
+    ProbeView:
+      type: object
+      description: Итог последнего опроса лимитов (LimitDiscoveryService).
+      properties:
+        ok:
+          type: boolean
+        method:
+          type: string
+          description: Что делали, например «GET /key».
+        http_status:
+          type: integer
+        error:
+          type: string
+        latency_ms:
+          type: integer
+          format: int64
+        checked_at:
+          type: string
+          format: date-time
+    Totals:
+      type: object
+      properties:
+        requests:
+          type: integer
+          format: int64
+        tokens:
+          type: integer
+          format: int64
+        errors:
+          type: integer
+          format: int64
+    HourBucket:
+      type: object
+      properties:
+        hour:
+          type: string
+          format: date-time
+        requests:
+          type: object
+          description: provider → количество запросов
+          additionalProperties:
+            type: integer
+            format: int64
+    RecentRequest:
+      type: object
+      properties:
+        created_at:
+          type: string
+          format: date-time
+        provider:
+          type: string
+        model:
+          type: string
+        status:
+          type: integer
+        latency_ms:
+          type: integer
+          format: int64
+        prompt_tokens:
+          type: integer
+        completion_tokens:
+          type: integer
+        total_tokens:
+          type: integer
+        error:
+          type: string
+    StatusSnapshot:
+      type: object
+      description: Полный срез состояния — ответ GET /status и data события SSE `snapshot`.
+      properties:
+        generated_at:
+          type: string
+          format: date-time
+        providers:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProviderStatus'
+        today:
+          $ref: '#/components/schemas/Totals'
+        hourly:
+          type: array
+          items:
+            $ref: '#/components/schemas/HourBucket'
+        recent:
+          type: array
+          items:
+            $ref: '#/components/schemas/RecentRequest'
+        routing:
+          $ref: '#/components/schemas/RoutingInfo'
+
+    CostEstimate:
+      type: object
+      description: Оценка стоимости на одной справочной (платной) модели.
+      properties:
+        model:
+          type: string
+        amount:
+          type: number
+    RunStats:
+      type: object
+      properties:
+        key:
+          type: string
+          nullable: true
+          description: Значение группировки (run_id / issue / client); null — запросы без метки.
+        run_ids:
+          type: array
+          items:
+            type: string
+        issues:
+          type: array
+          items:
+            type: string
+        clients:
+          type: array
+          items:
+            type: string
+        requests:
+          type: integer
+          format: int64
+          description: Попыток к провайдерам (включая неуспешные и failover)
+        errors:
+          type: integer
+          format: int64
+          description: Из них не 2xx
+        prompt_tokens:
+          type: integer
+          format: int64
+        completion_tokens:
+          type: integer
+          format: int64
+        total_tokens:
+          type: integer
+          format: int64
+        providers:
+          type: object
+          description: provider → число попыток
+          additionalProperties:
+            type: integer
+            format: int64
+        first_at:
+          type: string
+          format: date-time
+        last_at:
+          type: string
+          format: date-time
+        duration_ms:
+          type: integer
+          format: int64
+          description: От первой до последней попытки
+        latency_ms:
+          type: integer
+          format: int64
+        cost:
+          type: array
+          items:
+            $ref: '#/components/schemas/CostEstimate'
+    EfficiencyRow:
+      type: object
+      description: Строка таблицы «Эффективность»; поля ai-runner пустые, если runner не ответил.
+      properties:
+        run_id:
+          type: string
+        issue:
+          type: string
+        repo:
+          type: string
+        status:
+          type: string
+          description: Статус прогона в ai-runner (например QUEUED, RUNNING, AWAITING_CONFIRMATION, ...)
+        success:
+          type: boolean
+        attempts:
+          type: integer
+        duration_ms:
+          type: integer
+          format: int64
+        pr_url:
+          type: string
+        category:
+          type: string
+        requests:
+          type: integer
+          format: int64
+        errors:
+          type: integer
+          format: int64
+        total_tokens:
+          type: integer
+          format: int64
+        aider_tokens:
+          type: integer
+          format: int64
+        cost:
+          type: array
+          items:
+            $ref: '#/components/schemas/CostEstimate'
+    EfficiencySummary:
+      type: object
+      description: Сводка по завершённым прогонам ai-runner.
+      properties:
+        runs:
+          type: integer
+          format: int64
+        succeeded:
+          type: integer
+          format: int64
+        success_rate:
+          type: number
+          format: double
+        total_tokens:
+          type: integer
+          format: int64
+        tokens_per_success:
+          type: integer
+          format: int64
+        avg_attempts:
+          type: number
+          format: double
+        cost:
+          type: array
+          items:
+            $ref: '#/components/schemas/CostEstimate'
+    EfficiencyReport:
+      type: object
+      properties:
+        runner_available:
+          type: boolean
+        runner_error:
+          type: string
+        pricing_note:
+          type: string
+        currency:
+          type: string
+        summary:
+          $ref: '#/components/schemas/EfficiencySummary'
+        runs:
+          type: array
+          items:
+            $ref: '#/components/schemas/EfficiencyRow'
+        other:
+          type: array
+          description: Прогоны, которых нет у ai-runner
+          items:
+            $ref: '#/components/schemas/RunStats'
