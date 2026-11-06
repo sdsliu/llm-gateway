@@ -1,6 +1,7 @@
 package ru.akiev.gateway.usage;
 
 import java.time.Instant;
+import java.util.Collection;
 import java.util.List;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
@@ -9,6 +10,12 @@ import org.springframework.data.repository.query.Param;
 public interface UsageRecordRepository extends JpaRepository<UsageRecord, Long> {
 
     List<UsageRecord> findByCreatedAtAfterOrderByCreatedAtAsc(Instant from);
+
+    /** Запросы одного прогона, по времени. Пустой список, если такого run_id нет. */
+    List<UsageRecord> findByRunIdOrderByCreatedAtAscIdAsc(String runId);
+
+    /** Записи перечисленных прогонов без ограничения по дате (фильтр {@code ?runId=} у /stats/runs). */
+    List<UsageRecord> findByRunIdIn(Collection<String> runIds);
 
     List<UsageRecord> findTop20ByOrderByCreatedAtDescIdDesc();
 

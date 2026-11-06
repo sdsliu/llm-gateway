@@ -7,6 +7,8 @@ import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.List;
 import org.junit.jupiter.api.Test;
+import ru.akiev.gateway.dto.ChatRequest;
+import ru.akiev.gateway.dto.Message;
 import ru.akiev.gateway.usage.RequestTags;
 import ru.akiev.gateway.usage.UsageRecord;
 
@@ -51,6 +53,9 @@ class RunStatsAggregatorTest {
         assertThat(r1.providers()).containsEntry("groq", 2L).containsEntry("kilo", 1L);
         assertThat(r1.durationMs()).isEqualTo(65_000);
         assertThat(r1.issues()).containsExactly("42");
+        // Старые строки без x-attempt и без оценки: множество пустое, максимум — по фактическому prompt
+        assertThat(r1.attempts()).isEmpty();
+        assertThat(r1.maxPromptTokens()).isEqualTo(3000);
         // 4000/1M × 2 + 1000/1M × 10 = 0.008 + 0.01 = 0.018
         assertThat(r1.cost()).singleElement().satisfies(c -> {
             assertThat(c.model()).isEqualTo("paid-model");
@@ -105,6 +110,36 @@ class RunStatsAggregatorTest {
     }
 
     @Test
+    void attemptsAndEstimatedContextSurviveNullColumns() {
+        RequestTags.Metrics big = new RequestTags.Metrics(2, "same", 4, 400, 80, null, false);
+        RequestTags.Metrics small = new RequestTags.Metrics(1, "other", 1, 4, 40, 16, true);
+        List<UsageRecord> rs = List.of(
+                // успех: фактический prompt важнее оценки этой же строки
+                new UsageRecord("groq", "m", 10, 1, 11, 200, 5, null, T0, new RequestTags("r", null, null, null, small)),
+                // 413 без usage: в максимум идёт оценка
+                new UsageRecord("groq", "m", null, null, null, 413, 5, "too big", T0.plusSeconds(1),
+                        new RequestTags("r", null, null, null, big)),
+                // строка до V4: NULL в новых колонках не роняет агрегацию
+                rec("groq", 500, null, null, 2, run("r")));
+
+        RunStats r = agg.aggregate(rs, RunStatsAggregator.GroupBy.RUN, 10).get(0);
+        assertThat(r.attempts()).containsExactly(1, 2);
+        assertThat(r.maxPromptTokens()).isEqualTo(80);
+        assertThat(r.promptTokens()).isEqualTo(10);
+        assertThat(r.errors()).isEqualTo(2);
+        assertThat(r.requests()).isEqualTo(3);
+
+        var view = RunRequests.of("r", rs);
+        assertThat(view.requests().get(1).error()).isEqualTo("too big");
+        assertThat(view.requests().get(1).estPromptTokens()).isEqualTo(80);
+        assertThat(view.requests().get(1).promptTokens()).isNull();
+        assertThat(view.totals().maxPromptTokens()).isEqualTo(80);
+        assertThat(view.totals().byAttempt()).containsEntry("1", 1L).containsEntry("2", 1L);
+        assertThat(view.requests().get(2).attempt()).isNull();
+        assertThat(RunRequests.Item.truncate("e".repeat(500))).hasSize(300);
+    }
+
+    @Test
     void requestTagsAreTrimmedAndBlankIsNull() {
         RequestTags t = new RequestTags("  r1 \n", "", "x".repeat(100), null);
         assertThat(t.runId()).isEqualTo("r1");
@@ -114,5 +149,29 @@ class RunStatsAggregatorTest {
             assertThat(RequestTags.current().runId()).isEqualTo("r1");
         }
         assertThat(RequestTags.current()).isEqualTo(RequestTags.NONE);
+
+        assertThat(RequestTags.parseAttempt(null)).isNull();
+        assertThat(RequestTags.parseAttempt("  ")).isNull();
+        assertThat(RequestTags.parseAttempt("2")).isEqualTo(2);
+        assertThat(RequestTags.parseAttempt(" 3 ")).isEqualTo(3);
+        assertThat(RequestTags.parseAttempt("nope")).isNull();
+        assertThat(RequestTags.parseAttempt("2.5")).isNull();
+        assertThat(RequestTags.parseAttempt("999999999999")).isNull();
+
+        ChatRequest req = new ChatRequest("m", List.of(new Message("user", "hi")), false, null, null, 10,
+                null, null, null, null);
+        RequestTags captured = RequestTags.capture(" r ", null, null, null, " 2 ", req);
+        assertThat(captured.runId()).isEqualTo("r");
+        assertThat(captured.metrics().attempt()).isEqualTo(2);
+        assertThat(captured.metrics().messagesCount()).isEqualTo(1);
+        assertThat(captured.metrics().requestChars()).isEqualTo(2);
+        // 2 символа → 1 токен + 4 служебных
+        assertThat(captured.metrics().estPromptTokens()).isEqualTo(5);
+        assertThat(captured.metrics().maxTokens()).isEqualTo(10);
+        assertThat(captured.metrics().stream()).isFalse();
+        assertThat(captured.metrics().requestId()).hasSize(36);
+        assertThat(captured.metrics().claimFailoverIndex()).isZero();
+        assertThat(captured.metrics().claimFailoverIndex()).isEqualTo(1);
+        assertThat(RequestTags.capture("r", null, null, null, "x", req).metrics().attempt()).isNull();
     }
 }

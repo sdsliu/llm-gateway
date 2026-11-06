@@ -10,7 +10,9 @@ import java.time.Instant;
 
 /**
  * Одна попытка обращения к провайдеру. Схема — db/migration/V1__usage_record.sql,
- * метки запроса (run_id, issue, client, request_user) — V2__usage_record_tags.sql.
+ * метки запроса (run_id, issue, client, request_user) — V2__usage_record_tags.sql,
+ * размеры входящего запроса — V4__usage_record_request_metrics.sql.
+ * Тело запроса сюда не пишется.
  */
 @Entity
 @Table(name = "usage_record")
@@ -39,6 +41,21 @@ public class UsageRecord {
     private String client;
     @Column(name = "request_user")
     private String requestUser;
+    /** Номер попытки runner (x-attempt). NULL у старых строк и если заголовок был не целым. */
+    private Integer attempt;
+    @Column(name = "request_id")
+    private String requestId;
+    @Column(name = "failover_index")
+    private Integer failoverIndex;
+    @Column(name = "messages_count")
+    private Integer messagesCount;
+    @Column(name = "request_chars")
+    private Long requestChars;
+    @Column(name = "est_prompt_tokens")
+    private Integer estPromptTokens;
+    @Column(name = "max_tokens")
+    private Integer maxTokens;
+    private Boolean stream;
 
     protected UsageRecord() {
         // для JPA
@@ -57,7 +74,7 @@ public class UsageRecord {
         this.createdAt = createdAt;
     }
 
-    /** То же + метки клиентского запроса (x-run-id, x-issue, x-client, user). */
+    /** То же + метки (x-run-id, x-issue, x-client, user) и метрики запроса, если они есть в tags. */
     public UsageRecord(String provider, String model, Integer promptTokens, Integer completionTokens,
             Integer totalTokens, int status, long latencyMs, String error, Instant createdAt, RequestTags tags) {
         this(provider, model, promptTokens, completionTokens, totalTokens, status, latencyMs, error, createdAt);
@@ -66,7 +83,26 @@ public class UsageRecord {
             this.issue = tags.issue();
             this.client = tags.client();
             this.requestUser = tags.user();
+            RequestTags.Metrics m = tags.metrics();
+            if (m != null) {
+                this.attempt = m.attempt();
+                this.requestId = m.requestId();
+                this.failoverIndex = m.claimFailoverIndex();
+                this.messagesCount = m.messagesCount();
+                this.requestChars = m.requestChars();
+                this.estPromptTokens = m.estPromptTokens();
+                this.maxTokens = m.maxTokens();
+                this.stream = m.stream();
+            }
         }
+    }
+
+    /**
+     * Размер контекста для статистики: фактические {@code prompt_tokens}, а если провайдер их не прислал —
+     * оценка входа. null — старая строка, где нет ни того, ни другого (агрегаты не должны из-за этого падать).
+     */
+    public Integer contextTokens() {
+        return promptTokens != null ? promptTokens : estPromptTokens;
     }
 
     public Long getId() { return id; }
@@ -83,6 +119,14 @@ public class UsageRecord {
     public String getIssue() { return issue; }
     public String getClient() { return client; }
     public String getRequestUser() { return requestUser; }
+    public Integer getAttempt() { return attempt; }
+    public String getRequestId() { return requestId; }
+    public Integer getFailoverIndex() { return failoverIndex; }
+    public Integer getMessagesCount() { return messagesCount; }
+    public Long getRequestChars() { return requestChars; }
+    public Integer getEstPromptTokens() { return estPromptTokens; }
+    public Integer getMaxTokens() { return maxTokens; }
+    public Boolean getStream() { return stream; }
 
     public boolean isSuccess() {
         return status >= 200 && status < 300;

@@ -13,8 +13,10 @@ import java.util.Map;
  * @param requests    попыток к провайдерам (включая неуспешные и failover)
  * @param errors      из них неуспешных (не 2xx)
  * @param providers   провайдер → число попыток
- * @param durationMs  от первой до последней попытки (грубая оценка длительности задачи)
- * @param cost        оценка стоимости на платных моделях (см. {@link PricingProperties})
+ * @param durationMs      от первой до последней попытки (грубая оценка длительности задачи)
+ * @param cost            оценка стоимости на платных моделях (см. {@link PricingProperties})
+ * @param attempts        номера попыток runner ({@code x-attempt}), по возрастанию; пусто, если заголовка не было
+ * @param maxPromptTokens максимальный размер контекста: фактический prompt, иначе оценка; 0 если неизвестно
  */
 public record RunStats(
         String key,
@@ -31,7 +33,9 @@ public record RunStats(
         @JsonProperty("last_at") Instant lastAt,
         @JsonProperty("duration_ms") long durationMs,
         @JsonProperty("latency_ms") long latencyMs,
-        List<CostEstimate> cost) {
+        List<CostEstimate> cost,
+        List<Integer> attempts,
+        @JsonProperty("max_prompt_tokens") long maxPromptTokens) {
 
     /** Оценка стоимости на одной справочной модели. */
     public record CostEstimate(String model, BigDecimal amount) {

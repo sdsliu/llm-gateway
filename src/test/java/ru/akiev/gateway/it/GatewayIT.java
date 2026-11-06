@@ -56,6 +56,9 @@ class GatewayIT {
     static void props(DynamicPropertyRegistry r) {
         PRIMARY.start();
         SECONDARY.start();
+        // Иначе HEADROOM (режим по умолчанию) сначала берёт провайдера без RPM — у него запас 1.0,
+        // а у primary с rpm=50 запас 0.98. Тест проверяет порядок priority.
+        r.add("gateway.routing.mode", () -> "priority");
         r.add("gateway.providers[0].name", () -> "primary");
         r.add("gateway.providers[0].base-url", () -> PRIMARY.baseUrl() + "/v1");
         r.add("gateway.providers[0].api-key", () -> "key-primary");

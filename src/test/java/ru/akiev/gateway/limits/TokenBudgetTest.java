@@ -104,6 +104,9 @@ class TokenBudgetTest {
                 null, null, null, null);
         // 400 символов / 4 = 100 + 4 служебных на сообщение + max_tokens 100
         assertThat(est.estimate(withMax).total()).isEqualTo(204);
+        assertThat(RequestEstimator.measureInput(withMax).messages()).isEqualTo(1);
+        assertThat(RequestEstimator.measureInput(withMax).chars()).isEqualTo(400);
+        assertThat(RequestEstimator.measureInput(withMax).tokens()).isEqualTo(104);
         var noMax = new ChatRequest("m", List.of(new Message("user", "hi")), false, null, null, null,
                 null, null, null, null);
         assertThat(est.estimate(noMax).output()).isEqualTo(1024);

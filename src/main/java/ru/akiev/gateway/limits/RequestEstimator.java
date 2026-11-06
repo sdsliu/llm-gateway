@@ -29,17 +29,30 @@ public final class RequestEstimator {
         }
     }
 
+    /**
+     * Размер входа без max_tokens: сколько сообщений, сколько символов в content и грубая оценка prompt-токенов.
+     * Этим же пользуется учёт usage_record — число не зависит от {@code default-max-tokens}.
+     */
+    public record Input(int messages, long chars, long tokens) {
+    }
+
     public Estimate estimate(ChatRequest request) {
+        Input in = measureInput(request);
+        long output = request.maxTokens() != null && request.maxTokens() > 0 ? request.maxTokens() : defaultMaxTokens;
+        return new Estimate(in.tokens(), output);
+    }
+
+    /** Оценка только входа. {@code request == null} или пустые сообщения — нули, без исключения. */
+    public static Input measureInput(ChatRequest request) {
         long chars = 0;
         int messages = 0;
-        if (request.messages() != null) {
+        if (request != null && request.messages() != null) {
             for (Message m : request.messages()) {
                 messages++;
                 chars += m.content() != null ? m.content().length() : 0;
             }
         }
-        long input = (chars + CHARS_PER_TOKEN - 1) / CHARS_PER_TOKEN + (long) messages * TOKENS_PER_MESSAGE;
-        long output = request.maxTokens() != null && request.maxTokens() > 0 ? request.maxTokens() : defaultMaxTokens;
-        return new Estimate(input, output);
+        long tokens = (chars + CHARS_PER_TOKEN - 1) / CHARS_PER_TOKEN + (long) messages * TOKENS_PER_MESSAGE;
+        return new Input(messages, chars, tokens);
     }
 }
