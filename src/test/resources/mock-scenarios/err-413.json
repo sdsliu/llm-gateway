@@ -1,0 +1,5 @@
+{
+  "mode": "error",
+  "status": 413,
+  "message": "Request too large for mock scenario err-413"
+}

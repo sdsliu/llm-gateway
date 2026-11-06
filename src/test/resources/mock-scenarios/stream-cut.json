@@ -1,0 +1,6 @@
+{
+  "mode": "stream-cut",
+  "content": "MOCK_STREAM_CUT_HEAD\nMOCK_STREAM_CUT_TAIL\n",
+  "firstChunk": "MOCK_STREAM_CUT_HEAD",
+  "usage": {"prompt_tokens": 9, "completion_tokens": 2, "total_tokens": 11}
+}

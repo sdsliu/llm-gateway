@@ -5,12 +5,18 @@ import java.util.ArrayList;
 import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.env.Environment;
+import org.springframework.core.env.Profiles;
+import org.springframework.core.env.StandardEnvironment;
 import org.springframework.web.reactive.function.client.WebClient;
 import ru.akiev.gateway.provider.LlmProvider;
 import ru.akiev.gateway.provider.OpenAiCompatibleProvider;
+import ru.akiev.gateway.provider.mock.MockProvider;
+import ru.akiev.gateway.provider.mock.MockScenarioCatalog;
 import ru.akiev.gateway.router.ProviderRouter;
 import ru.akiev.gateway.router.RoutingSettings;
 import ru.akiev.gateway.usage.UsageService;
@@ -32,12 +38,52 @@ public class ProviderConfig {
      * (или ключ необязателен: api-key-optional: true) и корректный base-url.
      * Пустой ключ, битый URL (пустой сегмент пути — не задан account id) — провайдер отключается с WARN.
      * WebClient.Builder Spring Boot создаёт сам (с настроенным Jackson), провайдер делает clone().
+     *
+     * <p>{@code type: mock} живёт только в профилях {@code mock} и {@code test}. В профиле {@code mock}
+     * (и при {@code gateway.mock.exclusive=true}) остальные провайдеры не попадают в роутер, группы моделей
+     * не применяются: любое имя модели отвечает mock.
      */
     @Bean
     public ProviderRouter providerRouter(WebClient.Builder builder, GatewayProperties props, Clock clock,
+            UsageService usageService, RoutingProperties routing, LimitsProperties limits, Environment environment,
+            MockProperties mockProps, ObjectProvider<MockScenarioCatalog> mockCatalog) {
+        return buildRouter(builder, props, clock, usageService, routing, limits, environment, mockProps,
+                mockCatalog.getIfAvailable());
+    }
+
+    /** Для тестов без Spring-окружения: профиль mock не активен, каталога сценариев нет. */
+    public ProviderRouter providerRouter(WebClient.Builder builder, GatewayProperties props, Clock clock,
             UsageService usageService, RoutingProperties routing, LimitsProperties limits) {
+        return buildRouter(builder, props, clock, usageService, routing, limits, new StandardEnvironment(),
+                new MockProperties(null, "diff-ok", false), null);
+    }
+
+    private ProviderRouter buildRouter(WebClient.Builder builder, GatewayProperties props, Clock clock,
+            UsageService usageService, RoutingProperties routing, LimitsProperties limits, Environment environment,
+            MockProperties mockProps, MockScenarioCatalog catalog) {
+        boolean mockAllowed = environment.acceptsProfiles(Profiles.of("mock", "test"));
+        boolean exclusive = environment.acceptsProfiles(Profiles.of("mock"))
+                || (mockProps != null && mockProps.exclusive());
         List<ProviderProperties> usable = new ArrayList<>();
+        int skipped = 0;
         for (ProviderProperties p : props.providers()) {
+            if ("mock".equals(p.type())) {
+                if (!mockAllowed || catalog == null) {
+                    log.warn("Провайдер {} отключён: type=mock доступен только в профилях mock и test", p.name());
+                    continue;
+                }
+                String why = p.disabledReason();
+                if (why != null) {
+                    log.warn("Провайдер {} отключён: {}", p.name(), why);
+                    continue;
+                }
+                usable.add(p);
+                continue;
+            }
+            if (exclusive) {
+                skipped++;
+                continue;
+            }
             String why = p.disabledReason();
             if (why != null) {
                 log.warn("Провайдер {} отключён: {}", p.name(), why);
@@ -48,12 +94,20 @@ public class ProviderConfig {
             }
             usable.add(p);
         }
-        ModelGroups groups = ModelGroups.compile(props.modelGroups(),
-                usable.stream().map(ProviderProperties::name).toList());
-        List<LlmProvider> providers = usable.stream()
-                .map(p -> p.withExtraModels(groups.extraModels(p.name())))
-                .map(p -> (LlmProvider) new OpenAiCompatibleProvider(builder, p, clock))
-                .toList();
+        if (exclusive) {
+            log.info("Профиль mock: пропущено провайдеров не-mock: {}, группы моделей не применяются", skipped);
+        }
+        List<String> names = usable.stream().map(ProviderProperties::name).toList();
+        ModelGroups groups = exclusive ? ModelGroups.EMPTY : ModelGroups.compile(props.modelGroups(), names);
+        List<LlmProvider> providers = new ArrayList<>();
+        for (ProviderProperties p : usable) {
+            ProviderProperties ready = p.withExtraModels(groups.extraModels(p.name()));
+            if ("mock".equals(ready.type())) {
+                providers.add(new MockProvider(ready, clock, java.util.Objects.requireNonNull(catalog), usageService));
+            } else {
+                providers.add(new OpenAiCompatibleProvider(builder, ready, clock));
+            }
+        }
         if (providers.isEmpty()) {
             log.warn("Нет ни одного включённого провайдера — все запросы будут получать 503");
         }

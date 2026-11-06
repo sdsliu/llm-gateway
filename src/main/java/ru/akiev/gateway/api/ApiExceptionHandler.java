@@ -1,5 +1,7 @@
 package ru.akiev.gateway.api;
 
+import java.time.Duration;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -37,8 +39,13 @@ public class ApiExceptionHandler {
 
     @ExceptionHandler(ProviderException.class)
     public ResponseEntity<ErrorResponse> provider(ProviderException e) {
-        return ResponseEntity.status(e.status())
-                .body(ErrorResponse.of(e.getMessage(), "provider_error", String.valueOf(e.status())));
+        ResponseEntity.BodyBuilder response = ResponseEntity.status(e.status());
+        Duration retry = e.retryAfter();
+        if (retry != null && retry.compareTo(Duration.ZERO) > 0) {
+            long seconds = Math.max(1, (retry.toMillis() + 999) / 1000);
+            response.header(HttpHeaders.RETRY_AFTER, Long.toString(seconds));
+        }
+        return response.body(ErrorResponse.of(e.getMessage(), "provider_error", String.valueOf(e.status())));
     }
 
     @ExceptionHandler(AllProvidersUnavailableException.class)

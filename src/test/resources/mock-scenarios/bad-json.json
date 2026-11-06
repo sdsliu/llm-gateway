@@ -1,0 +1,6 @@
+{
+  "mode": "raw",
+  "status": 200,
+  "body": "{\"id\":\"chatcmpl-bad\",\"object\":\"chat.completion\",\"choices\":[",
+  "usage": {"prompt_tokens": 6, "completion_tokens": 1, "total_tokens": 7}
+}

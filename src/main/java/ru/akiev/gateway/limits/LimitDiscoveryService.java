@@ -26,6 +26,7 @@ import ru.akiev.gateway.config.LimitsProperties;
 import ru.akiev.gateway.config.ProviderProperties;
 import ru.akiev.gateway.provider.LlmProvider;
 import ru.akiev.gateway.provider.OpenAiCompatibleProvider;
+import ru.akiev.gateway.provider.mock.MockProvider;
 import ru.akiev.gateway.provider.ProviderState;
 import ru.akiev.gateway.provider.RateLimitHeaders;
 import ru.akiev.gateway.router.ProviderRouter;
@@ -271,6 +272,10 @@ public class LimitDiscoveryService implements SmartInitializingSingleton {
     }
 
     private ProbeKind kind(LlmProvider p) {
+        // Mock не ходит в сеть, даже если в конфиге забыли limits-probe: none.
+        if (p instanceof MockProvider) {
+            return ProbeKind.NONE;
+        }
         return config(p).map(ProbeKind::of).orElse(ProbeKind.NONE);
     }
 

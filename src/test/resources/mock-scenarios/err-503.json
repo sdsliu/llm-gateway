@@ -1,0 +1,5 @@
+{
+  "mode": "error",
+  "status": 503,
+  "message": "mock scenario err-503: upstream unavailable"
+}

@@ -1,0 +1,5 @@
+{
+  "mode": "completion",
+  "content": "src/test/java/demo/HelloTest.java\n<<<<<<< SEARCH\n        assertEquals(\"hello\", new Hello().greet());\n=======\n        assertEquals(\"hello, world\", new Hello().greet());\n>>>>>>> REPLACE\n",
+  "usage": {"prompt_tokens": 18, "completion_tokens": 11, "total_tokens": 29}
+}

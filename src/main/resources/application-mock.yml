@@ -1,0 +1,46 @@
+# Профиль mock: шлюз отвечает заготовками, без ключей и без расхода токенов.
+# ./mvnw spring-boot:run -Pmock-llm
+# ./mvnw verify -Pmock-llm
+# В профиле по умолчанию этот файл не читается.
+
+spring:
+  datasource:
+    url: jdbc:h2:mem:gatewaymock;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+
+gateway:
+  # Не опрашивать OpenRouter, даже если в окружении есть ключ, а список провайдеров слился с application.yml.
+  openrouter:
+    name: mock
+  mock:
+    # true — в роутере и на дашборде только type: mock, группы моделей не применяются.
+    exclusive: true
+    default-scenario: diff-ok
+    # Пусто — файлы с classpath mock-scenarios/ (их кладёт профиль Maven mock-llm).
+    scenarios-dir: ${MOCK_SCENARIOS_DIR:}
+  providers:
+    - name: mock
+      type: mock
+      # Никуда не ходим: ping и лимиты обслуживаются локально (limits-probe: none).
+      base-url: http://127.0.0.1:9/v1
+      api-key: not-used
+      api-key-optional: true
+      model: mock
+      # Имена, которые клиенты уже шлют. Любое другое тоже отвечает mock: в этом профиле групп моделей нет.
+      models:
+        - gpt-oss-120b
+        - openai/gpt-oss-120b
+      priority: 1
+      # Сценарий timeout ждёт ровно столько и отвечает 504.
+      timeout: 500ms
+      stream-usage: true
+      limits-probe: none
+      # 0 = без лимита. Явно, чтобы при слиянии списков не унаследовать TPM Groq с тем же индексом.
+      limits:
+        rpm: 0
+        rpd: 0
+        tpm: 0
+        tokens-per-day: 0
+        tokens-per-month: 0

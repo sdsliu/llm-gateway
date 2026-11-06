@@ -1,0 +1,5 @@
+{
+  "mode": "completion",
+  "content": "pom.xml\n<<<<<<< SEARCH\n        <java.version>21</java.version>\n=======\n        <java.version>21</java.version>\n        <skipTests>true</skipTests>\n>>>>>>> REPLACE\n",
+  "usage": {"prompt_tokens": 15, "completion_tokens": 8, "total_tokens": 23}
+}

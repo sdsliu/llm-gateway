@@ -37,7 +37,7 @@ class ProviderHealthPingTest {
                 Duration.ofSeconds(5), null, true, pingPath, null);
         return new ProviderHealthService(new GatewayProperties(List.of(p), Duration.ofMinutes(5)),
                 WebClient.builder(), Clock.systemUTC(), Duration.ofSeconds(5), Duration.ofMinutes(10), false,
-                DataSize.ofMegabytes(16));
+                DataSize.ofMegabytes(16), new ru.akiev.gateway.config.MockProperties(null, "diff-ok", false));
     }
 
     /** Похоже на реальный GET https://openrouter.ai/api/v1/models: ~350 моделей, у каждой много полей. */

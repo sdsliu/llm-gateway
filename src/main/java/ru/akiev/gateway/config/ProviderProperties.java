@@ -45,6 +45,8 @@ import org.springframework.http.HttpHeaders;
  * @param limitsProbeUrl полный URL для опроса лимитов, если он не {base-url}/key или {base-url}/test-auth
  * @param maxConcurrency сколько запросов может быть в полёте одновременно. null или неположительное — без ограничения.
  *                    Сверх лимита провайдер пропускается, всплеск уходит к остальным.
+ * @param type        {@code openai} (по умолчанию) — OpenAI-совместимый HTTP; {@code mock} — заготовленные
+ *                    сценарии без сети. {@code mock} создаётся только в профилях {@code mock} и {@code test}.
  */
 public record ProviderProperties(
         @NotBlank String name,
@@ -62,7 +64,8 @@ public record ProviderProperties(
         List<String> models,
         @DefaultValue("auto") String limitsProbe,
         String limitsProbeUrl,
-        Integer maxConcurrency) {
+        Integer maxConcurrency,
+        @DefaultValue("openai") String type) {
 
     /** Канонический конструктор — по нему Spring Boot биндит application.yml (их у record теперь два). */
     @ConstructorBinding
@@ -71,6 +74,7 @@ public record ProviderProperties(
         extraBody = extraBody == null ? Map.of() : java.util.Collections.unmodifiableMap(new LinkedHashMap<>(extraBody));
         models = models == null ? List.of() : List.copyOf(models);
         limitsProbe = limitsProbe == null || limitsProbe.isBlank() ? "auto" : limitsProbe.trim().toLowerCase(java.util.Locale.ROOT);
+        type = type == null || type.isBlank() ? "openai" : type.trim().toLowerCase(java.util.Locale.ROOT);
     }
 
     /** Без extra-body (для кода и тестов, написанных до его появления). */
@@ -92,7 +96,7 @@ public record ProviderProperties(
             Duration timeout, Limits limits, boolean streamUsage, String pingPath, List<String> fallbackModels,
             Map<String, Object> extraBody, boolean apiKeyOptional) {
         this(name, baseUrl, apiKey, model, priority, timeout, limits, streamUsage, pingPath, fallbackModels,
-                extraBody, apiKeyOptional, null, "auto", null, null);
+                extraBody, apiKeyOptional, null, "auto", null, null, null);
     }
 
     /** Без max-concurrency (код и тесты до распределения in-flight). */
@@ -101,7 +105,7 @@ public record ProviderProperties(
             Map<String, Object> extraBody, boolean apiKeyOptional, List<String> models, String limitsProbe,
             String limitsProbeUrl) {
         this(name, baseUrl, apiKey, model, priority, timeout, limits, streamUsage, pingPath, fallbackModels,
-                extraBody, apiKeyOptional, models, limitsProbe, limitsProbeUrl, null);
+                extraBody, apiKeyOptional, models, limitsProbe, limitsProbeUrl, null, null);
     }
 
     /**
@@ -199,7 +203,7 @@ public record ProviderProperties(
         }
         return new ProviderProperties(name, baseUrl, apiKey, model, priority, timeout, limits, streamUsage, pingPath,
                 fallbackModels, extraBody, apiKeyOptional, List.copyOf(merged), limitsProbe, limitsProbeUrl,
-                maxConcurrency);
+                maxConcurrency, type);
     }
 
     static String baseUrlProblem(String baseUrl) {

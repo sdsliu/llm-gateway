@@ -20,6 +20,8 @@ OpenAI Chat Completions и отправляет их бесплатным или
 - **Подмена модели**: клиенту нужно имя или алиас из `model-groups` (сейчас `gpt-oss-120b` и `openai/gpt-oss-120b`). Если имени нет ни в группах, ни среди моделей провайдеров, группа не выбирается, и каждому провайдеру уходит его модель из конфига.
 - **Учёт usage**: таблица `usage_record` (Flyway). В неё попадает каждая попытка: провайдер, модель, токены,
   статус и задержка.
+- **Mock-провайдер** (`type: mock`) для прогонов ai-runner без токенов: только профили `mock` и `test`,
+  в профиле по умолчанию выключен. Сценарии и fault injection — раздел «Mock-провайдер».
 - **Дашборд** на `/`, обновляется в реальном времени через SSE. Есть также JSON `GET /status`.
 - **Режим роутинга** переключается с дашборда: по запасу лимитов (по умолчанию), по приоритету (с выбором primary)
   или round-robin.
@@ -159,6 +161,7 @@ gateway:
 | Поле | Обязательно | Описание |
 |---|---|---|
 | `name` | да | имя в логах, `/status`, `usage_record` |
+| `type` | нет (`openai`) | `openai` — HTTP к `base-url`; `mock` — заготовленные сценарии без сети, и только в профилях `mock`/`test` |
 | `base-url` | да | OpenAI-совместимый префикс (без `/chat/completions`) |
 | `api-key` | нет | пустой → провайдер пропускается (`skipped`), если не задан `api-key-optional` |
 | `api-key-optional` | нет (false) | `true` — keyless-провайдер: при пустом `api-key` не пропускается, запросы идут без `Authorization` |
@@ -210,6 +213,61 @@ gateway:
 | `X-RateLimit-Remaining`, `X-RateLimit-Reset` (epoch ms) | OpenRouter | то же |
 | `ratelimit-remaining`, `ratelimit-reset` (секунды), `x-ratelimit-remaining-minute` | OVHcloud (IETF draft) | то же |
 | `Retry-After` (секунды или HTTP-дата) | все | длительность cooldown после 429/5xx |
+
+## Mock-провайдер
+
+Детерминированные ответы для ai-runner (цикл на mock-LLM и fault injection) без ключей и без расхода токенов.
+В `src/main/resources/application.yml` такого провайдера нет: `type: mock` создаётся только при активных профилях
+`mock` или `test`. В профиле `mock` в роутинг попадает он один, группы моделей не применяются — клиент может слать
+любое имя, в том числе `gpt-oss-120b`.
+
+```bash
+./mvnw spring-boot:run -Pmock-llm    # http://localhost:4000, профиль mock, H2 в памяти
+./mvnw verify -Pmock-llm             # тесты и подъём того же шлюза на время интеграционных тестов
+./mvnw verify                        # обычная проверка; сценарии mock покрыты тестами шлюза
+```
+
+Профиль Maven `mock-llm` копирует `src/test/resources/mock-scenarios/` на classpath, подключает H2 и выставляет
+`spring.profiles.active=mock` (`application-mock.yml`). Своя папка сценариев: `MOCK_SCENARIOS_DIR=/path` или
+`gateway.mock.scenarios-dir`. Файл `{id}.json` из каталога перекрывает одноимённый с classpath.
+Сценарий по умолчанию — `diff-ok` (`gateway.mock.default-scenario`).
+
+Запрос в формате OpenAI, и без стрима, и с `stream: true` (SSE `data: …` / `data: [DONE]`). В успешном ответе есть
+`usage`, попытка пишется в `usage_record` вместе с `x-run-id` — учёт прогона тот же, что у живого провайдера.
+
+Сценарий выбирается так:
+
+1. заголовок `x-mock-scenario`;
+2. иначе известный id внутри `x-run-id` (`diff-ok`, `20261106-101500-edit-pom`, `abc:err-429` — кусок равен id или
+   заканчивается на `-id`; из нескольких берётся самый длинный);
+3. иначе `diff-ok`.
+
+| Сценарий | Что получает клиент |
+|---|---|
+| `diff-ok` | 200, SEARCH/REPLACE для `src/main/java/demo/Hello.java` |
+| `diff-broken` | 200, SEARCH без закрывающего `>>>>>>> REPLACE` |
+| `edit-test` | 200, правка `src/test/java/demo/HelloTest.java` |
+| `edit-pom` | 200, в `pom.xml` добавляется `<skipTests>true</skipTests>` |
+| `empty` | 200, `content: ""` и `usage` |
+| `err-429` | 429 и `Retry-After: 17` (клиенту, без паузы провайдера) |
+| `err-503` | 503 `provider_error` |
+| `err-413` | 413 `request_too_large` |
+| `timeout` | 504 после `timeout` провайдера (в профиле mock это 500 мс) |
+| `stream-cut` | SSE: первый чанк, затем error-чанк и `[DONE]` (обрыв после первого чанка) |
+| `bad-json` | 200 и тело, которое не является JSON; в стриме такой чанк тоже не JSON |
+
+```bash
+curl -s localhost:4000/v1/chat/completions \
+  -H 'Content-Type: application/json' -H 'x-mock-scenario: diff-ok' -H 'x-run-id: run-1' \
+  -d '{"model":"gpt-oss-120b","messages":[{"role":"user","content":"hi"}]}'
+
+curl -s -D- localhost:4000/v1/chat/completions \
+  -H 'Content-Type: application/json' -H 'x-mock-scenario: err-429' \
+  -d '{"model":"mock","messages":[{"role":"user","content":"hi"}]}'
+```
+
+Неизвестный `x-mock-scenario` — 400, запрос не уходит «в никуда». Ошибки 429, 503 и таймаут mock отдаёт клиенту
+как есть: это fault injection, а не повод перебирать других провайдеров (в этом профиле их нет).
 
 ## Подключение клиентов
 
