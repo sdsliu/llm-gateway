@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 import org.springframework.web.reactive.function.client.WebClient;
@@ -53,6 +54,31 @@ class ProviderStartupValidationTest {
         });
         assertThat(appender.list).anySatisfy(e -> assertThat(e.getFormattedMessage())
                 .contains("groq").contains("отключён").contains("api-key не задан"));
+    }
+
+    /** type=mock в конфиге без профиля mock/test не создаёт провайдера. */
+    @Test
+    void mockTypeIsDisabledOutsideMockProfile() {
+        var mock = new ProviderProperties("mock", "http://127.0.0.1:9/v1", "not-used", "mock", 1,
+                Duration.ofMillis(500), null, true, "/models", List.of(), Map.of(), true,
+                List.of(), "none", null, null, "mock");
+        assertThat(mock.type()).isEqualTo("mock");
+        assertThat(mock.disabledReason()).isNull();
+        var logger = (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(ProviderConfig.class);
+        var appender = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            ProviderRouter router = new ProviderConfig().providerRouter(WebClient.builder(),
+                    new GatewayProperties(List.of(mock), Duration.ofMinutes(5)), Clock.systemUTC(),
+                    Mockito.mock(UsageService.class), null, LimitsProperties.LEGACY);
+            assertThat(router.names()).isEmpty();
+            assertThat(router.providers()).noneMatch(p -> p instanceof ru.akiev.gateway.provider.mock.MockProvider);
+        } finally {
+            logger.detachAppender(appender);
+        }
+        assertThat(appender.list).anySatisfy(e -> assertThat(e.getFormattedMessage())
+                .contains("mock").contains("type=mock"));
     }
 
     @Test

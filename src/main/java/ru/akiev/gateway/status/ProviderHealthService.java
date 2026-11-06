@@ -25,6 +25,7 @@ import org.springframework.web.reactive.function.client.WebClientResponseExcepti
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import ru.akiev.gateway.config.GatewayProperties;
+import ru.akiev.gateway.config.MockProperties;
 import ru.akiev.gateway.config.ProviderProperties;
 
 /**
@@ -62,18 +63,29 @@ public class ProviderHealthService {
             @Value("${gateway.health.timeout:PT10S}") Duration timeout,
             @Value("${gateway.health.models-ttl:PT10M}") Duration modelsTtl,
             @Value("${gateway.health.scheduled:false}") boolean scheduled,
-            @Value("${gateway.health.max-body-size:16MB}") DataSize maxBodySize) {
+            @Value("${gateway.health.max-body-size:16MB}") DataSize maxBodySize,
+            MockProperties mockProperties) {
         this.clock = clock;
         this.timeout = timeout;
         this.modelsTtl = modelsTtl;
         this.scheduled = scheduled;
+        boolean exclusive = mockProperties != null && mockProperties.exclusive();
         for (ProviderProperties p : props.providers()) {
-            providers.put(p.name(), p);
-            if (p.usable()) {
-                clients.put(p.name(), builder.clone().baseUrl(p.baseUrl())
-                        .codecs(c -> c.defaultCodecs().maxInMemorySize((int) maxBodySize.toBytes()))
-                        .defaultHeaders(p::applyAuth).build());
+            if (exclusive && !"mock".equals(p.type())) {
+                continue;
             }
+            providers.put(p.name(), p);
+            if (!p.usable()) {
+                continue;
+            }
+            if ("mock".equals(p.type())) {
+                // Локальный ответ: base-url mock-провайдера никуда не ведёт.
+                models.put(p.name(), new ModelsCache(p.allModels(), clock.instant(), null, clock.instant()));
+                continue;
+            }
+            clients.put(p.name(), builder.clone().baseUrl(p.baseUrl())
+                    .codecs(c -> c.defaultCodecs().maxInMemorySize((int) maxBodySize.toBytes()))
+                    .defaultHeaders(p::applyAuth).build());
         }
     }
 
@@ -134,6 +146,13 @@ public class ProviderHealthService {
     }
 
     private Mono<PingResult> pingMono(String name) {
+        ProviderProperties props = providers.get(name);
+        if (props != null && "mock".equals(props.type()) && props.usable()) {
+            models.put(name, new ModelsCache(props.allModels(), clock.instant(), null, clock.instant()));
+            PingResult r = new PingResult(name, "up", 0L, 200, null, clock.instant(), props.allModels().size());
+            lastPing.put(name, r);
+            return Mono.just(r);
+        }
         WebClient client = clients.get(name);
         if (client == null) {
             PingResult r = new PingResult(name, "skipped", null, null, skipReason(name), clock.instant(), null);

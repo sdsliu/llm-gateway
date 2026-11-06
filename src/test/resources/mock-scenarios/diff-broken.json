@@ -1,0 +1,5 @@
+{
+  "mode": "completion",
+  "content": "MOCK_DIFF_BROKEN\nsrc/main/java/demo/Hello.java\n<<<<<<< SEARCH\n        return \"hello\";\n=======\n        return \"broken\";\n",
+  "usage": {"prompt_tokens": 22, "completion_tokens": 9, "total_tokens": 31}
+}

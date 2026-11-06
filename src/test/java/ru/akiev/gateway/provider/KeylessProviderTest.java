@@ -113,7 +113,7 @@ class KeylessProviderTest {
         var health = new ProviderHealthService(
                 new GatewayProperties(List.of(props("kilo", "", true)), Duration.ofMinutes(5)),
                 WebClient.builder(), Clock.systemUTC(), Duration.ofSeconds(5), Duration.ofMinutes(10), false,
-                DataSize.ofMegabytes(16));
+                DataSize.ofMegabytes(16), new ru.akiev.gateway.config.MockProperties(null, "diff-ok", false));
 
         var r = health.ping("kilo");
 

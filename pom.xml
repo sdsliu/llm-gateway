@@ -130,4 +130,65 @@
       </plugin>
     </plugins>
   </build>
+
+  <!--
+    Mock-LLM для ai-runner: без ключей и без расхода токенов.
+    ./mvnw spring-boot:run -Pmock-llm   — шлюз на :4000, профиль mock, H2
+    ./mvnw verify -Pmock-llm            — тесты и тот же шлюз на время failsafe
+  -->
+  <profiles>
+    <profile>
+      <id>mock-llm</id>
+      <dependencies>
+        <dependency>
+          <groupId>com.h2database</groupId>
+          <artifactId>h2</artifactId>
+          <scope>runtime</scope>
+        </dependency>
+      </dependencies>
+      <properties>
+        <spring-boot.run.profiles>mock</spring-boot.run.profiles>
+      </properties>
+      <build>
+        <resources>
+          <resource>
+            <directory>src/main/resources</directory>
+          </resource>
+          <resource>
+            <directory>src/test/resources/mock-scenarios</directory>
+            <targetPath>mock-scenarios</targetPath>
+          </resource>
+        </resources>
+        <plugins>
+          <plugin>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-maven-plugin</artifactId>
+            <configuration>
+              <profiles>mock</profiles>
+            </configuration>
+            <executions>
+              <execution>
+                <id>start-mock-gateway</id>
+                <phase>pre-integration-test</phase>
+                <goals><goal>start</goal></goals>
+                <configuration>
+                  <profiles>mock</profiles>
+                  <jmxPort>9019</jmxPort>
+                  <maxAttempts>40</maxAttempts>
+                </configuration>
+              </execution>
+              <execution>
+                <id>stop-mock-gateway</id>
+                <phase>post-integration-test</phase>
+                <goals><goal>stop</goal></goals>
+                <configuration>
+                  <jmxPort>9019</jmxPort>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
 </project>

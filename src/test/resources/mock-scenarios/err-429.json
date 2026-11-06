@@ -1,0 +1,6 @@
+{
+  "mode": "error",
+  "status": 429,
+  "retryAfterSeconds": 17,
+  "message": "mock scenario err-429: rate limit exceeded"
+}
