@@ -305,6 +305,25 @@ public class ProviderRouter {
     }
 
     /**
+     * У группы задан свой TPM ({@code tpm-limit}). Запрос больше этого числа — 413 сразу,
+     * даже если у кого-то из участников TPM не задан или выше.
+     */
+    private void rejectIfLargerThanGroupTpm(Attempt a) {
+        if (a.resolution.kind() != ModelGroups.Kind.GROUP || a.resolution.group() == null) {
+            return;
+        }
+        Integer limit = a.resolution.group().tpmLimit();
+        if (limit == null || a.tokens <= limit) {
+            return;
+        }
+        String name = a.resolution.group().name();
+        log.warn("Запрос ~{} токенов больше TPM группы {} ({}) — 413 без попыток", a.tokens, name, limit);
+        throw new RequestTooLargeException("Request too large: ~" + a.tokens
+                + " tokens (input + max_tokens) exceeds the tokens-per-minute limit of model group '"
+                + name + "' (" + limit + "). Reduce the prompt or max_tokens.");
+    }
+
+    /**
      * Запрос больше TPM у всех провайдеров, кроме исключённых (и у каждого TPM известен) — 413 сразу,
      * не тратя ни одной попытки.
      */
@@ -680,6 +699,7 @@ public class ProviderRouter {
 
     public ChatResponse chat(ChatRequest request) {
         Attempt a = new Attempt(request);
+        rejectIfLargerThanGroupTpm(a);
         rejectIfLargerThanEveryTpm(a);
         Selection s;
         while ((s = next(a)) != null) {
@@ -731,6 +751,7 @@ public class ProviderRouter {
      */
     public StreamSession openStream(ChatRequest request) {
         Attempt a = new Attempt(request);
+        rejectIfLargerThanGroupTpm(a);
         rejectIfLargerThanEveryTpm(a);
         Selection s;
         while ((s = next(a)) != null) {

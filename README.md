@@ -1,7 +1,7 @@
 # llm-gateway
 
 Личный **OpenAI-совместимый LLM-шлюз** на Spring Boot 3 / Java 21. Он принимает запросы в формате
-OpenAI Chat Completions и отправляет их бесплатным или дешёвым провайдерам (Groq, Z.ai, Kilo, OVHcloud, Cloudflare Workers AI, OpenRouter, SambaNova и др.).
+OpenAI Chat Completions и отправляет их бесплатным или дешёвым провайдерам (Groq, Z.ai, Kilo, OVHcloud, Cloudflare Workers AI, OpenRouter, SambaNova, Gonka, Gemini и др.).
 Провайдеры перебираются по приоритету, а при исчерпании лимитов шлюз автоматически переключается на следующего.
 Каждый запрос записывается в PostgreSQL, а состояние видно на живом веб-дашборде.
 
@@ -17,7 +17,7 @@ OpenAI Chat Completions и отправляет их бесплатным или
 - **Маршрутизация по лимитам**: RPM, RPD, TPM, токены в сутки и в месяц. Лимиты шлюз узнаёт у самих провайдеров
   при старте (до приёма запросов) и из заголовков ответов; конфиг — запасной вариант. Не ответившие провайдеры
   исключаются из роутинга и перепроверяются раз в минуту. Подробно — «Лимиты провайдеров» ниже.
-- **Подмена модели**: клиенту нужно имя или алиас из `model-groups` (сейчас `gpt-oss-120b` и `openai/gpt-oss-120b`). Если имени нет ни в группах, ни среди моделей провайдеров, группа не выбирается, и каждому провайдеру уходит его модель из конфига.
+- **Подмена модели**: клиенту нужно имя или алиас из `model-groups` (сейчас `gpt-oss-120b` / `openai/gpt-oss-120b` и `large-context`). Если имени нет ни в группах, ни среди моделей провайдеров, группа не выбирается, и каждому провайдеру уходит его модель из конфига.
 - **Учёт usage**: таблица `usage_record` (Flyway). В неё попадает каждая попытка: провайдер, модель, токены,
   статус и задержка.
 - **Mock-провайдер** (`type: mock`) для прогонов ai-runner без токенов: только профили `mock` и `test`,
@@ -41,6 +41,8 @@ flowchart LR
     R -->|priority 5| CF[Cloudflare Workers AI]
     R -->|priority 6| OR[OpenRouter]
     R -->|priority 7| SN[SambaNova]
+    R -->|priority 8| GK[Gonka<br/>если есть ключ]
+    R -->|priority 9| GM[Gemini<br/>если есть ключ]
     R -. состояние: cooldown, RPM/RPD,<br/>x-ratelimit-* .-> S[(ProviderState<br/>LimitTracker)]
     R -->|RouterListener| U[UsageService<br/>usage]
     U --> DB[(PostgreSQL<br/>usage_record)]
@@ -126,6 +128,11 @@ Ping по расписанию: `gateway.health.scheduled=true` (интерва�
 | `OVH_AI_RPM` | `2` | RPM шлюза для OVHcloud; с ключом поставьте `400` |
 | `CLOUDFLARE_API_TOKEN` | — | токен Cloudflare с правами Workers AI (пусто → провайдер пропускается) |
 | `CLOUDFLARE_ACCOUNT_ID` | — | Account ID Cloudflare, подставляется в base-url |
+| `GONKA_API_KEY` | — | ключ Gonka Broker; пусто → провайдер выключен. В репозиторий не кладём |
+| `GONKA_BASE_URL` | `https://proxy.gonkabroker.com/v1` | OpenAI-совместимый base-url Gonka. Свой брокер — только через эту переменную |
+| `GONKA_LIMITS_PROBE_URL` | рядом с base-url, `GET /test-auth` без хвоста `/v1` | полный URL опроса лимитов, если он не выводится из `GONKA_BASE_URL` |
+| `GONKA_MODEL` | `deepseek-ai/DeepSeek-V4-Flash-0731` | model id Gonka (контекст 400000) и тот же id в группе `large-context` |
+| `GEMINI_API_KEY` | — | ключ Google AI Gemini; пусто → провайдер пропускается |
 | `DB_URL` | `jdbc:postgresql://localhost:5432/gateway` | JDBC URL |
 | `DB_USER` / `DB_PASSWORD` | `gateway` / `gateway` | учётные данные БД |
 | `DB_NAME`, `DB_PORT`, `GATEWAY_PORT` | `gateway`, `5432`, `4000` | только для docker compose |
@@ -186,6 +193,8 @@ gateway:
 | Cloudflare Workers AI | `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1` | `@cf/qwen/qwen3-30b-a3b-fp8` (free: 10 000 Neurons/сутки; 300 RPM) | 5 |
 | OpenRouter | `https://openrouter.ai/api/v1` | `nvidia/nemotron-3-super-120b-a12b:free` | 6 |
 | SambaNova Cloud | `https://api.sambanova.ai/v1` | `gpt-oss-120b` (Free Tier: 20 RPM / 20 RPD / 200K TPD на модель; без карты — 402) | 7 |
+| Gonka Broker | `${GONKA_BASE_URL}` (по умолчанию `https://proxy.gonkabroker.com/v1`) | `${GONKA_MODEL}`, по умолчанию `deepseek-ai/DeepSeek-V4-Flash-0731` (контекст 400000). Без `GONKA_API_KEY` выключен. `limits-probe: gonka` | 8 |
+| Gemini | `https://generativelanguage.googleapis.com/v1beta/openai` | `gemini-2.5-pro` (окно 1 048 576). Без `GEMINI_API_KEY` пропускается. Запас лимитов: 5 RPM / 250000 TPM | 9 |
 
 > Kilo AI Gateway ([docs](https://kilo.ai/docs/gateway), [Authentication](https://kilo.ai/docs/gateway/authentication)): без ключа доступны только бесплатные модели (`:free`), лимит — 200 запросов в час на IP. `api-key-optional: true`: без `KILO_API_KEY` запросы уходят без заголовка `Authorization`. Модель — `nvidia/nemotron-3-super-120b-a12b:free` (стабильно отвечает без ключа). Автовыбор случайной бесплатной модели Kilo не используем: часть таких моделей тратит весь `max_tokens` на reasoning и возвращает `content: null`. Список моделей: `curl https://ai-gateway.kilo.ai/api/v1/models` (бесплатные — с `:free`).
 
@@ -280,10 +289,24 @@ curl -s -D- localhost:4000/v1/chat/completions \
 | Что слать клиенту | Группа | Провайдеры (им уйдёт свой model id) | Контекст | Узкое место |
 |---|---|---|---|---|
 | `gpt-oss-120b` или алиас `openai/gpt-oss-120b` | `gpt-oss-120b` | Groq `openai/gpt-oss-120b`; OVHcloud `gpt-oss-120b`; SambaNova `gpt-oss-120b`; OpenRouter `openai/gpt-oss-120b` | 131k | **Groq, 8000 TPM** |
+| `large-context` | `large-context` | см. таблицу ниже. **Groq не входит** | до 1 048 576 (Gemini) | свой `tpm-limit: 100000` |
 
 Контекст 131k — как у `gpt-oss-120b` в конфиге. Самое узкое место группы по токенам в минуту — Groq: `limits.tpm: 8000`. У OVHcloud, SambaNova и OpenRouter TPM в конфиге нет (у OVH без ключа 2 RPM, у SambaNova 200K токенов в сутки, у OpenRouter 20 RPM / 50 RPD). Оба клиентских имени есть в `GET /v1/models`.
 
-Модели отдельных провайдеров из таблицы «Провайдеры из коробки» — `glm-4.7-flash`, `nvidia/nemotron-3-super-120b-a12b:free`, `@cf/qwen/qwen3-30b-a3b-fp8`. Запрос с таким именем идёт к провайдерам, у которых оно задано.
+Группа `large-context` — для задачи больше 1–3 файлов (запрос порядка 30k токенов). Groq с его 8000 TPM в неё не входит, поэтому такой запрос на Groq не уходит. У группы свой потолок `tpm-limit: 100000`: запрос больше этого числа шлюз отклоняет `413`, не вызывая провайдеров. Имя группы есть в `GET /v1/models`. Участник без ключа (Gonka, Gemini, OpenRouter, SambaNova) при старте выключается и в роутинг группы не попадает; Kilo и OVHcloud работают и без ключа.
+
+| Участник `large-context` | model id, который ему уйдёт | Контекст | Лимиты в конфиге (запас, пока провайдер не сообщил свои) |
+|---|---|---|---|
+| Gonka | `deepseek-ai/DeepSeek-V4-Flash-0731` или `GONKA_MODEL` | 400000 | 6 RPM, **100000 TPM**, 1 000 000 токенов в месяц. Нужен `GONKA_API_KEY`. Опрос лимитов: `limits-probe: gonka` |
+| Gemini | `gemini-2.5-pro` | 1 048 576 | 5 RPM, **250000 TPM**. Нужен `GEMINI_API_KEY` |
+| Kilo | `nvidia/nemotron-3-super-120b-a12b:free` | 262k | 10 RPM, 4800 RPD, TPM не задан. Ключ необязателен |
+| OVHcloud | `gpt-oss-120b` | 131k | 2 RPM без ключа (с ключом — `OVH_AI_RPM`). TPM не задан |
+| OpenRouter | `nvidia/nemotron-3-super-120b-a12b:free` | 262k | 20 RPM, 50 RPD. Нужен `OPENROUTER_API_KEY` |
+| SambaNova | `gpt-oss-120b` | 131k | 20 RPM, 20 RPD, 200K токенов в сутки. Нужен `SAMBANOVA_API_KEY` |
+
+**Как ai-runner выбирает группу (`modelLarge`).** У ai-runner обычная модель и отдельная настройка `modelLarge` для крупной задачи. В `modelLarge` нужно поставить `large-context`: runner отправит `"model": "large-context"`, и шлюз возьмёт эту группу, а не `gpt-oss-120b`. Запрос около 30k токенов укладывается в `tpm-limit` 100000 и в TPM участников группы; до Groq (8000 TPM) он не доходит, потому что Groq не участник.
+
+Модели отдельных провайдеров из таблицы «Провайдеры из коробки» — `glm-4.7-flash`, `nvidia/nemotron-3-super-120b-a12b:free`, `@cf/qwen/qwen3-30b-a3b-fp8`. Запрос с таким именем идёт к провайдерам, у которых оно задано. Z.ai и Cloudflare в `large-context` не входят: их модели по умолчанию не те, на которые рассчитана эта группа.
 
 ### curl
 
@@ -298,6 +321,10 @@ curl -s localhost:4000/v1/chat/completions -H 'Content-Type: application/json' \
 # стриминг — алиас той же группы
 curl -N localhost:4000/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model":"openai/gpt-oss-120b","stream":true,"messages":[{"role":"user","content":"Перечисли три цвета радуги"}]}'
+
+# крупная задача: то же имя, что ai-runner пишет в modelLarge
+curl -s localhost:4000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"large-context","messages":[{"role":"user","content":"Большой контекст"}]}'
 ```
 
 ### Aider
@@ -432,7 +459,7 @@ curl -s 'localhost:4000/stats/efficiency?days=30'
 |---|---|---|
 | Groq | `groq`: `GET /models`, затем крошечный `chat` (`max_tokens: 1`) | `x-ratelimit-limit-tokens` → TPM, `x-ratelimit-limit-requests` → **RPD** (у Groq это запросы в сутки) |
 | OpenRouter | `openrouter`: `GET /api/v1/key` | `rate_limit` → RPM (если указан); для `:free`-моделей `is_free_tier` → RPD 50 / 1000 |
-| Gonka Broker | `gonka`: `GET /test-auth` (адрес — `limits-probe-url`) | `maxRpm` → RPM (а также TPM и месячная квота, если они есть в ответе) |
+| Gonka Broker | `gonka`: `GET /test-auth`. Пустой `limits-probe-url` — тот же хост, что `base-url`, без хвоста `/v1` (у публичного прокси это `https://proxy.gonkabroker.com/test-auth`). Свой адрес — `GONKA_LIMITS_PROBE_URL` | `maxRpm` → RPM (а также TPM и месячная квота, если они есть в ответе) |
 | остальные | `models`: `GET {ping-path}` | лимиты, если провайдер присылает `x-ratelimit-limit-*` |
 | — | `none` | не опрашивать: провайдер всегда в роутинге, лимиты из конфига |
 
@@ -587,6 +614,21 @@ gateway:
           model: gpt-oss-120b
         - provider: openrouter
           model: openai/gpt-oss-120b        # платный id; :free → 404 «unavailable for free»
+    - name: large-context          # ai-runner: modelLarge=large-context
+      tpm-limit: 100000            # свой TPM группы; Groq (8000) сюда не входит
+      members:
+        - provider: gonka
+          model: deepseek-ai/DeepSeek-V4-Flash-0731
+        - provider: gemini
+          model: gemini-2.5-pro
+        - provider: kilo
+          model: nvidia/nemotron-3-super-120b-a12b:free
+        - provider: ovh
+          model: gpt-oss-120b
+        - provider: openrouter
+          model: nvidia/nemotron-3-super-120b-a12b:free
+        - provider: sambanova
+          model: gpt-oss-120b
 ```
 
 Имя модели `auto` (если нет группы с таким именем) значит «любой включённый провайдер, каждому его модель из конфига».
@@ -606,6 +648,8 @@ gateway:
 
 Что слать Nori: **`gpt-oss-120b`** или алиас **`openai/gpt-oss-120b`**. Оба имени есть в `GET /v1/models`.
 Таблица провайдеров группы и лимит — в «Подключение клиентов»: самое узкое место по TPM — Groq, 8000.
+Крупную задачу ai-runner отправляет именем из настройки **`modelLarge`**. Поставьте туда **`large-context`**:
+у группы свой `tpm-limit` 100000, Groq в ней нет, запрос ~30k токенов на Groq не попадает.
 Неизвестная модель по-прежнему означает «все провайдеры», но обычный 404 тогда не вызывает failover —
 для всплеска нужно имя группы.
 
@@ -681,6 +725,9 @@ HTTP API шлюза описано **сначала в контракте**, а 
 ./mvnw test     # быстрые unit/slice-тесты на H2 (≈190 шт., Docker не нужен), включая стражи контракта
 ./mvnw verify   # + интеграционные *IT: Testcontainers PostgreSQL 16 + WireMock (нужен Docker)
 ```
+
+В GitHub Actions (`.github/workflows/ci.yml`) на каждый push и pull request сначала запускается gitleaks
+(секрет-сканер, вывод секретов редактируется), затем `./mvnw verify`.
 
 Интеграционные тесты (`GatewayIT`) поднимают шлюз на случайном порту, настоящий PostgreSQL 16 с миграцией
 Flyway и двух провайдеров на WireMock. Они проверяют сквозные запросы без стриминга и со стримингом,

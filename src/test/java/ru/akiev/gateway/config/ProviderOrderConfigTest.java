@@ -18,7 +18,7 @@ import org.springframework.core.io.ClassPathResource;
 import org.yaml.snakeyaml.Yaml;
 
 /**
- * Порядок groq → zai → kilo → ovh → cloudflare → openrouter → sambanova;
+ * Порядок groq → zai → kilo → ovh → cloudflare → openrouter → sambanova → gonka → gemini;
  * Kilo/OVH — keyless (api-key-optional), Cloudflare — по токену и account id;
  * SambaNova: base-url/модель/лимиты Free Tier; Z.ai: thinking выключен через extra-body и короткий таймаут.
  */
@@ -51,7 +51,8 @@ class ProviderOrderConfigTest {
         var names = providers().stream()
                 .sorted(Comparator.comparingInt(p -> (Integer) p.get("priority")))
                 .map(p -> p.get("name")).toList();
-        assertThat(names).containsExactly("groq", "zai", "kilo", "ovh", "cloudflare", "openrouter", "sambanova");
+        assertThat(names).containsExactly("groq", "zai", "kilo", "ovh", "cloudflare", "openrouter", "sambanova",
+                "gonka", "gemini");
     }
 
     @Test

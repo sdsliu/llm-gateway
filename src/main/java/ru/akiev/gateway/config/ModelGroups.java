@@ -90,7 +90,8 @@ public final class ModelGroups {
                 log.warn("Группа {}: ни одного включённого провайдера — запросы к этой модели получат 503",
                         group.name());
             }
-            ModelGroupProperties compiled = new ModelGroupProperties(group.name(), group.aliases(), live);
+            ModelGroupProperties compiled = new ModelGroupProperties(group.name(), group.aliases(), live,
+                    group.tpmLimit());
             byAlias.put(group.name(), compiled);
             advertised.add(group.name());
             for (String alias : group.aliases()) {

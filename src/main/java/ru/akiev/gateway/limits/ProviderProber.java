@@ -81,8 +81,8 @@ public class ProviderProber {
     static String describe(ProbeKind kind, ProviderProperties p) {
         return switch (kind) {
             case GROQ -> "GET /models + POST /chat/completions (max_tokens=1)";
-            case OPENROUTER -> "GET " + (p.limitsProbeUrl() != null ? p.limitsProbeUrl() : "/key");
-            case GONKA -> "GET " + (p.limitsProbeUrl() != null ? p.limitsProbeUrl() : "/test-auth");
+            case OPENROUTER -> "GET " + probeTarget(p.limitsProbeUrl(), "/key");
+            case GONKA -> "GET " + gonkaProbeUrl(p);
             case NONE -> "—";
             default -> "GET " + pingPath(p);
         };
@@ -120,7 +120,7 @@ public class ProviderProber {
      * правило OpenRouter: 50 запросов в сутки на free tier и 1000 — если куплено ≥ 10 кредитов → rpd.
      */
     private Mono<ProbeResult> openRouter(WebClient client, ProviderProperties props, String method) {
-        String url = props.limitsProbeUrl() != null ? props.limitsProbeUrl() : "/key";
+        String url = probeTarget(props.limitsProbeUrl(), "/key");
         return client.get().uri(url).retrieve().toEntity(JsonNode.class)
                 .map(e -> ProbeResult.ok(method, parseOpenRouterKey(e.getBody(), props.model()), null,
                         e.getStatusCode().value(), null));
@@ -167,9 +167,33 @@ public class ProviderProber {
 
     // ---------- Gonka Broker: GET /test-auth ----------
 
+    /**
+     * Куда слать {@code GET /test-auth}. Пустой {@code limits-probe-url} (переменная не задана) — абсолютный
+     * адрес на том же хосте, что {@code base-url}, но без хвоста {@code /v1}: у Gonka опрос лежит рядом с
+     * {@code /v1}, а не под ним. Явный {@code limits-probe-url} не переписываем.
+     */
+    static String gonkaProbeUrl(ProviderProperties props) {
+        if (props.limitsProbeUrl() != null && !props.limitsProbeUrl().isBlank()) {
+            return props.limitsProbeUrl().trim();
+        }
+        String base = props.baseUrl() == null ? "" : props.baseUrl().trim();
+        while (base.endsWith("/")) {
+            base = base.substring(0, base.length() - 1);
+        }
+        if (base.endsWith("/v1")) {
+            base = base.substring(0, base.length() - 3);
+        }
+        return base.isEmpty() ? "/test-auth" : base + "/test-auth";
+    }
+
+    /** Пустая строка из {@code ${VAR:}} — то же, что значение не задано. */
+    private static String probeTarget(String configured, String fallback) {
+        return configured == null || configured.isBlank() ? fallback : configured.trim();
+    }
+
     /** GET /test-auth → где-то в JSON maxRpm (ищем рекурсивно: max_rpm / maxRpm / rpm), а также TPM и месяц, если есть. */
     private Mono<ProbeResult> gonka(WebClient client, ProviderProperties props, String method) {
-        String url = props.limitsProbeUrl() != null ? props.limitsProbeUrl() : "/test-auth";
+        String url = gonkaProbeUrl(props);
         return client.get().uri(url).retrieve().toEntity(JsonNode.class)
                 .map(e -> ProbeResult.ok(method, parseGonka(e.getBody()), e.getHeaders(), e.getStatusCode().value(),
                         null));
