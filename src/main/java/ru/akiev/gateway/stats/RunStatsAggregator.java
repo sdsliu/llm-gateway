@@ -12,6 +12,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.function.Function;
 import ru.akiev.gateway.usage.UsageRecord;
 
@@ -60,8 +61,9 @@ public class RunStatsAggregator {
     }
 
     RunStats stats(String key, List<UsageRecord> rs) {
-        long errors = 0, prompt = 0, completion = 0, total = 0, latency = 0;
+        long errors = 0, prompt = 0, completion = 0, total = 0, latency = 0, maxPrompt = 0;
         Set<String> runIds = new LinkedHashSet<>(), issues = new LinkedHashSet<>(), clients = new LinkedHashSet<>();
+        Set<Integer> attempts = new TreeSet<>();
         Map<String, Long> providers = new LinkedHashMap<>();
         var first = rs.get(0).getCreatedAt();
         var last = first;
@@ -76,12 +78,16 @@ public class RunStatsAggregator {
             addIfPresent(runIds, r.getRunId());
             addIfPresent(issues, r.getIssue());
             addIfPresent(clients, clientOf(r));
+            // NULL attempt и NULL-размеры старых строк просто пропускаем — группа всё равно собирается
+            if (r.getAttempt() != null) attempts.add(r.getAttempt());
+            Integer ctx = r.contextTokens();
+            if (ctx != null) maxPrompt = Math.max(maxPrompt, ctx.longValue());
             if (r.getCreatedAt().isBefore(first)) first = r.getCreatedAt();
             if (r.getCreatedAt().isAfter(last)) last = r.getCreatedAt();
         }
         return new RunStats(key, List.copyOf(runIds), List.copyOf(issues), List.copyOf(clients), rs.size(), errors,
                 prompt, completion, total, providers, first, last, Duration.between(first, last).toMillis(), latency,
-                cost(prompt, completion));
+                cost(prompt, completion), List.copyOf(attempts), maxPrompt);
     }
 
     /** Оценка стоимости: tokens / 1M × цена, для каждой справочной модели. */

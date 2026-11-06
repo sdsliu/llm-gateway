@@ -37,7 +37,7 @@ tags:
   - name: providers
     description: Ping провайдеров и списки моделей
   - name: stats
-    description: Статистика по прогонам / issue / клиентам
+    description: Статистика по прогонам / issue / клиентам и список запросов одного прогона
 
 paths:
   /v1/chat/completions:
@@ -60,12 +60,16 @@ paths:
         `data: {"error": {...}}` и затем `data: [DONE]`. Заголовки стрима: `Cache-Control: no-cache`,
         `X-Accel-Buffering: no`.
 
-        Заголовки `x-run-id`, `x-issue`, `x-client` и поле `user` сохраняются как метки в usage_record
-        (используются в `/stats/*`).
+        Заголовки `x-run-id`, `x-issue`, `x-client`, `x-attempt` и поле `user` сохраняются как метки в usage_record
+        (используются в `/stats/*`). `x-attempt` — целое число попытки runner; нечисло или пусто сохраняется
+        как NULL, запрос из-за этого не отклоняется. На каждый входящий запрос заводится один `request_id`
+        (общий для failover-попыток). Рядом пишутся число сообщений, размер в символах, оценка входа,
+        `max_tokens` и `stream` — в том числе если провайдер не вернул `usage`. Тело запроса не хранится.
       parameters:
         - $ref: '#/components/parameters/RunId'
         - $ref: '#/components/parameters/Issue'
         - $ref: '#/components/parameters/Client'
+        - $ref: '#/components/parameters/Attempt'
         - $ref: '#/components/parameters/Authorization'
       requestBody:
         required: true
@@ -355,6 +359,15 @@ paths:
           schema:
             type: integer
             default: 200
+        - name: runId
+          in: query
+          required: false
+          description: |
+            Список `run_id` через запятую (`r1,r2`). Пробелы вокруг запятой обрезаются, пустые куски
+            отбрасываются. Если список непустой — агрегаты только по этим прогонам, окно `days` не
+            применяется (нужно списку задач). Пустая строка — как будто параметра нет.
+          schema:
+            type: string
       responses:
         '200':
           description: Список агрегатов
@@ -366,6 +379,45 @@ paths:
                   $ref: '#/components/schemas/RunStats'
         '400':
           description: "Неверный `groupBy` (`groupBy: run | issue | client`), стандартное тело ошибки Spring."
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SpringError'
+
+  /stats/runs/{runId}/requests:
+    get:
+      tags: [stats]
+      operationId: getRunRequests
+      summary: Запросы одного прогона
+      description: |
+        Попытки к провайдерам с этим `run_id` (включая неуспешные и failover), по времени
+        (`created_at`, затем id). Не больше 2000 строк: если записей больше, остаются первые 2000
+        (самые ранние).
+        Неизвестный `runId` — 200 и пустой `requests` (не 404).
+        `attempt` оставляет только строки с этим номером попытки runner (`x-attempt`).
+        Поле `error` обрезано до 300 символов. Тела запросов не хранятся и не отдаются.
+      parameters:
+        - name: runId
+          in: path
+          required: true
+          description: Значение `x-run-id`, как оно сохранено (после обрезки — до 128 символов).
+          schema:
+            type: string
+        - name: attempt
+          in: query
+          required: false
+          description: Номер попытки runner. Без параметра — все попытки прогона.
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Список запросов и итоги по отданным строкам
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunRequests'
+        '400':
+          description: "`attempt` не целое число. Стандартное тело ошибки Spring."
           content:
             application/json:
               schema:
@@ -416,6 +468,15 @@ components:
       schema:
         type: string
         maxLength: 64
+    Attempt:
+      name: x-attempt
+      in: header
+      required: false
+      description: |
+        Номер попытки runner (1..N), целое. Нечисло, пустая строка и переполнение int сохраняются
+        как NULL — запрос при этом не отклоняется. Обрезаются пробелы по краям.
+      schema:
+        type: string
     Authorization:
       name: Authorization
       in: header
@@ -1036,6 +1097,135 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/CostEstimate'
+        attempts:
+          type: array
+          description: |
+            Номера попыток runner (`x-attempt`) в группе, без повторов, по возрастанию.
+            Пустой массив, если заголовка не было (в том числе у старых строк с NULL).
+          items:
+            type: integer
+        max_prompt_tokens:
+          type: integer
+          format: int64
+          description: |
+            Максимальный размер контекста в группе. Берётся `prompt_tokens`, а если провайдер их
+            не прислал — `est_prompt_tokens`. 0, если нет ни того, ни другого (старые строки).
+    RunRequests:
+      type: object
+      description: Ответ GET /stats/runs/{runId}/requests.
+      properties:
+        run_id:
+          type: string
+          description: Эхо `runId` из пути, даже если запросов нет.
+        requests:
+          type: array
+          items:
+            $ref: '#/components/schemas/RunRequest'
+        totals:
+          $ref: '#/components/schemas/RunRequestTotals'
+    RunRequest:
+      type: object
+      description: |
+        Одна попытка к провайдеру. Поля размеров NULL у строк, записанных до миграции V4
+        (в JSON такие поля отсутствуют).
+      properties:
+        id:
+          type: integer
+          format: int64
+        request_id:
+          type: string
+          nullable: true
+          description: UUID входящего POST /v1/chat/completions; общий у failover-попыток.
+        attempt:
+          type: integer
+          nullable: true
+          description: Заголовок x-attempt. NULL, если не передавали или он был не целым.
+        failover_index:
+          type: integer
+          nullable: true
+          description: 0 — первый провайдер этого входящего запроса, далее 1, 2, …
+        created_at:
+          type: string
+          format: date-time
+        provider:
+          type: string
+        model:
+          type: string
+          nullable: true
+        status:
+          type: integer
+          description: HTTP-статус попытки к провайдеру.
+        latency_ms:
+          type: integer
+          format: int64
+        prompt_tokens:
+          type: integer
+          nullable: true
+          description: Из usage провайдера. NULL, если usage не было (413/429/503 и старые строки).
+        completion_tokens:
+          type: integer
+          nullable: true
+        total_tokens:
+          type: integer
+          nullable: true
+        est_prompt_tokens:
+          type: integer
+          nullable: true
+          description: Оценка входа до отправки (~4 символа на токен + 4 на сообщение). Есть и у ошибок без usage.
+        messages_count:
+          type: integer
+          nullable: true
+        request_chars:
+          type: integer
+          format: int64
+          nullable: true
+          description: Сумма длин content сообщений. Тело запроса не хранится.
+        max_tokens:
+          type: integer
+          nullable: true
+          description: max_tokens из тела запроса; NULL, если клиент поле не прислал.
+        stream:
+          type: boolean
+          nullable: true
+        error:
+          type: string
+          nullable: true
+          description: Текст ошибки, не длиннее 300 символов.
+    RunRequestTotals:
+      type: object
+      description: Итоги по строкам, которые вошли в `requests` (после фильтра attempt и лимита 2000).
+      properties:
+        requests:
+          type: integer
+          format: int64
+        errors:
+          type: integer
+          format: int64
+          description: Сколько строк не 2xx.
+        prompt_tokens:
+          type: integer
+          format: int64
+          description: Сумма фактических prompt_tokens; NULL в строке считается как 0 (оценка сюда не входит).
+        completion_tokens:
+          type: integer
+          format: int64
+        max_prompt_tokens:
+          type: integer
+          format: int64
+          description: Как в RunStats — максимум фактического prompt или оценки.
+        by_provider:
+          type: object
+          description: Провайдер → число попыток.
+          additionalProperties:
+            type: integer
+            format: int64
+        by_attempt:
+          type: object
+          description: |
+            Номер попытки (`x-attempt`) строкой → число попыток. Строки с attempt=NULL в карту не входят.
+          additionalProperties:
+            type: integer
+            format: int64
     EfficiencyRow:
       type: object
       description: Строка таблицы «Эффективность»; поля ai-runner пустые, если runner не ответил.

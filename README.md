@@ -262,7 +262,7 @@ aider --openai-api-base http://localhost:4000/v1 --openai-api-key dummy \
       x-client: aider
 ```
 
-`extra_params` уходит в `litellm.completion()`, `extra_headers` — заголовками запроса. Шлюз пишет `x-run-id`, `x-issue` и `x-client` в `usage_record`.
+`extra_params` уходит в `litellm.completion()`, `extra_headers` — заголовками запроса. Шлюз пишет `x-run-id`, `x-issue`, `x-client` и `x-attempt` в `usage_record` (см. «Заголовки клиента»).
 
 ### OpenHands
 
@@ -301,23 +301,48 @@ print(client.chat.completions.create(model="openai/gpt-oss-120b",
   ```
 - **`GET /actuator/health`**: healthcheck.
 
+## Заголовки клиента
+
+Клиент может пометить запрос. Шлюз пишет метки в `usage_record` (миграции `V2__usage_record_tags.sql` и
+`V4__usage_record_request_metrics.sql`) и отдаёт их в `/stats/*`. **Тело запроса не хранится** — только
+размеры и числа. Все заголовки необязательны; без них запрос учитывается как раньше (группа «(без метки)»).
+
+| Заголовок / поле | Кто шлёт | Что попадает в учёт | Пример |
+|---|---|---|---|
+| `x-run-id` | ai-runner, project-sage | `run_id`, до 128 символов | `20261017-101500-42` |
+| `x-issue` | ai-runner, project-sage | `issue`, до 64 символов | `42` |
+| `x-client` | ai-runner, project-sage | `client`, до 64 символов | `ai-runner` |
+| `x-attempt` | ai-runner | номер попытки runner, целое. Нечисло или пусто → `NULL`, запрос не отклоняется | `2` |
+| поле `user` в теле | любой OpenAI-клиент | `request_user`; если нет `x-client`, по нему же группируется «клиент» | `project-sage` |
+
+На один входящий `POST /v1/chat/completions` шлюз заводит `request_id` (UUID). Если запрос ушёл к нескольким
+провайдерам (failover), у всех попыток один `request_id`, а `failover_index` — 0, 1, …. Рядом пишутся
+`messages_count`, `request_chars`, оценка входа `est_prompt_tokens` (~4 символа на токен плюс 4 на сообщение),
+`max_tokens` из тела и `stream`. Эти поля есть и у неуспешной попытки, когда провайдер не прислал `usage`
+(413 / 429 / 503) — по ним видно, что запрос не влез в контекст.
+
+```bash
+curl -s localhost:4000/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -H 'x-run-id: t1' -H 'x-attempt: 1' -H 'x-issue: 42' -H 'x-client: ai-runner' \
+  -d '{"model":"gpt-oss-120b","messages":[{"role":"user","content":"Привет"}]}'
+
+# список запросов прогона; ?attempt=1 — только эта попытка. Неизвестный run — 200 и пустой список
+curl -s 'localhost:4000/stats/runs/t1/requests'
+curl -s 'localhost:4000/stats/runs/t1/requests?attempt=1'
+```
+
 ## Эффективность: учёт по прогонам (`/stats/runs`, `/stats/efficiency`)
 
-Клиенты помечают запросы заголовками — шлюз сохраняет их в `usage_record`
-(миграция `V2__usage_record_tags.sql`, колонки `run_id`, `issue`, `client`, `request_user`):
-
-| Заголовок / поле | Кто шлёт | Пример |
-|---|---|---|
-| `x-run-id` | ai-runner, project-sage | `20261017-101500-42` |
-| `x-issue` | ai-runner, project-sage | `42` |
-| `x-client` | ai-runner, project-sage | `ai-runner` |
-| поле `user` в теле | любой OpenAI-клиент | `project-sage` |
-
-Все метки необязательны; без них запрос учитывается как раньше (группа «(без метки)»).
+Метки запроса — в разделе «Заголовки клиента». Агрегат группы дополнительно содержит `attempts`
+(номера `x-attempt`) и `max_prompt_tokens` (фактический prompt, а если его не было — оценка входа;
+у старых строк с NULL это 0, страница от этого не ломается).
 
 ```bash
 # агрегаты: запросы, prompt/completion токены, провайдеры, первый/последний запрос, ошибки, оценка стоимости
 curl -s 'localhost:4000/stats/runs?groupBy=run&days=30&limit=200'   # groupBy = run | issue | client
+# только указанные прогоны, без окна days (для списка задач)
+curl -s 'localhost:4000/stats/runs?runId=t1,t2'
 # склейка с итогами ai-runner (успех, попытки, PR, категория ошибки)
 curl -s 'localhost:4000/stats/efficiency?days=30'
 ```
@@ -540,7 +565,7 @@ HTTP API шлюза описано **сначала в контракте**, а 
 
 - **Где контракт:** [`src/main/resources/openapi/llm-gateway.yaml`](src/main/resources/openapi/llm-gateway.yaml)
   (OpenAPI 3.0.3, описания на русском). Это единственный источник правды: все пути, параметры, заголовки
-  (`x-run-id`, `x-issue`, `x-client`), тела запросов/ответов и коды ошибок (400, 404, 413, 429, 503).
+  (`x-run-id`, `x-issue`, `x-client`, `x-attempt`), тела запросов/ответов и коды ошибок (400, 404, 413, 429, 503).
 - **Swagger UI:** <http://localhost:4000/swagger-ui.html> — показывает именно этот файл (его же можно скачать:
   <http://localhost:4000/openapi/llm-gateway.yaml>). `/v3/api-docs` — то, что springdoc построил по коду
   контроллеров; полезно для сравнения, но правда — YAML.
@@ -557,7 +582,7 @@ HTTP API шлюза описано **сначала в контракте**, а 
 2. Контроллеры пишут `implements XxxApi` и только `@Override`-ят методы. Аннотаций путей в них нет.
    Опция `skipDefaultInterface=true` убирает «заглушки 501»: забыли реализовать метод или контракт поменял
    сигнатуру — **ошибка компиляции**.
-3. Остальные схемы (`StatusSnapshot`, `RoutingInfo`, `PingResult`, `ModelsCache`, `RunStats`, `EfficiencyReport`,
+3. Остальные схемы (`StatusSnapshot`, `RoutingInfo`, `PingResult`, `ModelsCache`, `RunStats`, `RunRequests`, `EfficiencyReport`,
    `ChatRequest`/`ChatResponse`, `ErrorResponse`) сопоставлены существующим Java-record'ам через
    `schemaMappings` — генератор подставляет их в сигнатуры интерфейсов, а не создаёт копии. Эти record'ы
    используются внутри шлюза (роутер, SSE, статистика) и уже пишут ровно тот JSON, что в контракте
@@ -620,7 +645,7 @@ target/generated-sources/openapi/   сгенерировано из контра
 src/main/resources/
 ├── openapi/llm-gateway.yaml   OpenAPI-контракт (API first, источник правды)
 ├── application.yml
-├── db/migration/V1__usage_record.sql
+├── db/migration/   Flyway: V1 usage_record, V2 метки, V3 routing_settings, V4 метрики запроса
 └── static/     index.html, app.js, style.css (дашборд)
 docs/webflux-notes.md   учебный конспект по WebClient / Reactor / SSE
 Dockerfile, docker-compose.yml, docker-compose.hostnet.yml, .env.example

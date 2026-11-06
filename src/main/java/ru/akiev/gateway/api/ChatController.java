@@ -65,15 +65,17 @@ public class ChatController implements OpenaiApi {
      * stream=false → ChatResponse (JSON, как раньше);
      * stream=true  → StreamingResponseBody (text/event-stream в формате OpenAI).
      *
-     * <p>Заголовки x-run-id / x-issue / x-client и поле user из тела привязываются к потоку
-     * ({@link RequestTags}) — так каждая попытка в usage_record получает метки прогона.
+     * <p>Заголовки x-run-id / x-issue / x-client / x-attempt и поле user из тела привязываются к потоку
+     * ({@link RequestTags}) вместе с размерами запроса — так каждая попытка в usage_record, включая
+     * неуспешную и стрим, получает одни и те же метрики. x-attempt разбирается как целое; иначе NULL.
      */
     @PostMapping("/v1/chat/completions")
     public Object chat(@Valid @RequestBody ChatRequest request, HttpServletResponse response,
             @RequestHeader(value = "x-run-id", required = false) String runId,
             @RequestHeader(value = "x-issue", required = false) String issue,
-            @RequestHeader(value = "x-client", required = false) String client) {
-        RequestTags tags = new RequestTags(runId, issue, client, request.user());
+            @RequestHeader(value = "x-client", required = false) String client,
+            @RequestHeader(value = "x-attempt", required = false) String attempt) {
+        RequestTags tags = RequestTags.capture(runId, issue, client, request.user(), attempt, request);
         if (!request.streamRequested()) {
             try (var scope = RequestTags.bind(tags)) {
                 return router.chat(request);

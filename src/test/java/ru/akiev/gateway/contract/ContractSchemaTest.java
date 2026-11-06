@@ -17,6 +17,7 @@ import ru.akiev.gateway.dto.ErrorResponse;
 import ru.akiev.gateway.dto.Message;
 import ru.akiev.gateway.dto.Usage;
 import ru.akiev.gateway.stats.EfficiencyMerger;
+import ru.akiev.gateway.stats.RunRequests;
 import ru.akiev.gateway.stats.RunStats;
 import ru.akiev.gateway.status.ProviderHealthService;
 import ru.akiev.gateway.status.RoutingInfo;
@@ -53,6 +54,9 @@ class ContractSchemaTest {
                 Arguments.of("ModelsCache", ProviderHealthService.ModelsCache.class),
                 Arguments.of("RunStats", RunStats.class),
                 Arguments.of("CostEstimate", RunStats.CostEstimate.class),
+                Arguments.of("RunRequests", RunRequests.class),
+                Arguments.of("RunRequest", RunRequests.Item.class),
+                Arguments.of("RunRequestTotals", RunRequests.Totals.class),
                 Arguments.of("EfficiencyReport", EfficiencyMerger.Report.class),
                 Arguments.of("EfficiencyRow", EfficiencyMerger.Row.class),
                 Arguments.of("EfficiencySummary", EfficiencyMerger.Summary.class),
