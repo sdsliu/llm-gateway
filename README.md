@@ -17,7 +17,7 @@ OpenAI Chat Completions и отправляет их бесплатным или
 - **Маршрутизация по лимитам**: RPM, RPD, TPM, токены в сутки и в месяц. Лимиты шлюз узнаёт у самих провайдеров
   при старте (до приёма запросов) и из заголовков ответов; конфиг — запасной вариант. Не ответившие провайдеры
   исключаются из роутинга и перепроверяются раз в минуту. Подробно — «Лимиты провайдеров» ниже.
-- **Подмена модели**: клиент шлёт любое имя (например `openai/coder`), провайдеру уходит модель из конфига.
+- **Подмена модели**: клиенту нужно имя или алиас из `model-groups` (сейчас `gpt-oss-120b` и `openai/gpt-oss-120b`). Если имени нет ни в группах, ни среди моделей провайдеров, группа не выбирается, и каждому провайдеру уходит его модель из конфига.
 - **Учёт usage**: таблица `usage_record` (Flyway). В неё попадает каждая попытка: провайдер, модель, токены,
   статус и задержка.
 - **Дашборд** на `/`, обновляется в реальном времени через SSE. Есть также JSON `GET /status`.
@@ -184,11 +184,11 @@ gateway:
 | OpenRouter | `https://openrouter.ai/api/v1` | `nvidia/nemotron-3-super-120b-a12b:free` | 6 |
 | SambaNova Cloud | `https://api.sambanova.ai/v1` | `gpt-oss-120b` (Free Tier: 20 RPM / 20 RPD / 200K TPD на модель; без карты — 402) | 7 |
 
-> Kilo AI Gateway ([docs](https://kilo.ai/docs/gateway), [Authentication](https://kilo.ai/docs/gateway/authentication)): без ключа доступны только бесплатные модели (`:free`), лимит — 200 запросов в час на IP. `api-key-optional: true`: без `KILO_API_KEY` запросы уходят без заголовка `Authorization`. Модель — `nvidia/nemotron-3-super-120b-a12b:free` (стабильно отвечает без ключа). `kilo-auto/free` не используем: он уводит запрос на случайную free-модель, часть которых тратит весь `max_tokens` на reasoning и возвращает `content: null`. Список моделей: `curl https://ai-gateway.kilo.ai/api/v1/models` (бесплатные — с `:free`).
+> Kilo AI Gateway ([docs](https://kilo.ai/docs/gateway), [Authentication](https://kilo.ai/docs/gateway/authentication)): без ключа доступны только бесплатные модели (`:free`), лимит — 200 запросов в час на IP. `api-key-optional: true`: без `KILO_API_KEY` запросы уходят без заголовка `Authorization`. Модель — `nvidia/nemotron-3-super-120b-a12b:free` (стабильно отвечает без ключа). Автовыбор случайной бесплатной модели Kilo не используем: часть таких моделей тратит весь `max_tokens` на reasoning и возвращает `content: null`. Список моделей: `curl https://ai-gateway.kilo.ai/api/v1/models` (бесплатные — с `:free`).
 
 > OVHcloud AI Endpoints ([Getting started](https://docs.ovhcloud.com/en/guides/public-cloud/ai-machine-learning/ai-endpoints-getting-started)): анонимно — 2 запроса в минуту на IP и на модель, с ключом — 400 в минуту на проект и модель (429 при превышении). OVH присылает `ratelimit-remaining` / `ratelimit-reset`: при остатке 0 шлюз сам ставит паузу до сброса окна. Каталог моделей: `curl https://oai.endpoints.kepler.ai.cloud.ovh.net/v1/models` (без ключа).
 
-> Cloudflare Workers AI ([OpenAI compatibility](https://developers.cloudflare.com/workers-ai/configuration/open-ai-compatibility/), [Pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/), [Limits](https://developers.cloudflare.com/workers-ai/platform/limits/)): нужны `CLOUDFLARE_API_TOKEN` и `CLOUDFLARE_ACCOUNT_ID`. Бесплатно — 10 000 Neurons в сутки; `@cf/qwen/qwen3-30b-a3b-fp8` стоит 4625 neurons / M входных и 30475 / M выходных токенов (≈ 330k выходных токенов в сутки, у `llama-3.3-70b-instruct-fp8-fast` — ≈ 49k). Суточная квота считается в нейронах, поэтому RPD шлюза не задан: исчерпание квоты = ошибка Cloudflare → cooldown и failover. OpenAI-совместимого `GET /models` нет (405) — ping считает такой ответ «доступен».
+> Cloudflare Workers AI ([OpenAI compatibility](https://developers.cloudflare.com/workers-ai/configuration/open-ai-compatibility/), [Pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/), [Limits](https://developers.cloudflare.com/workers-ai/platform/limits/)): нужны `CLOUDFLARE_API_TOKEN` и `CLOUDFLARE_ACCOUNT_ID`. Бесплатно — 10 000 Neurons в сутки; `@cf/qwen/qwen3-30b-a3b-fp8` стоит 4625 neurons / M входных и 30475 / M выходных токенов (≈ 330k выходных токенов в сутки; у более дорогой 70B-модели на том же тарифе — ≈ 49k). Суточная квота считается в нейронах, поэтому RPD шлюза не задан: исчерпание квоты = ошибка Cloudflare → cooldown и failover. OpenAI-совместимого `GET /models` нет (405) — ping считает такой ответ «доступен».
 
 > SambaNova: OpenAI-совместимый API, `Authorization: Bearer <SAMBANOVA_API_KEY>` ([API keys and URLs](https://docs.sambanova.ai/docs/en/get-started/api-keys-urls), [OpenAI compatibility](https://docs.sambanova.ai/docs/en/features/openai-compatibility)). Лимиты Free Tier по [Rate limits](https://docs.sambanova.ai/docs/en/models/rate-limits): 20 RPM / 20 RPD / 200K токенов в день на каждую модель; заголовки `x-ratelimit-*-requests` (минута) и `x-ratelimit-*-requests-day` (сутки). **Важно:** с августа 2026 SambaCloud без привязанной карты отвечает `402 PAYMENT_METHOD_REQUIRED` (проверено 2026-10-17 на всех моделях из `/v1/models`). Шлюз считает 402 поводом для failover: SambaNova получает cooldown, запрос уходит дальше.
 >
@@ -215,6 +215,18 @@ gateway:
 
 Шлюзу ключ от клиента не нужен, но многие клиенты требуют непустой ключ. Передайте любой, например `dummy`.
 
+### Какую модель указывать клиенту
+
+Имена — из `gateway.model-groups` в `src/main/resources/application.yml`. Имя вне этого списка группу не выбирает: срабатывает подмена на модель провайдера.
+
+| Что слать клиенту | Группа | Провайдеры (им уйдёт свой model id) | Контекст | Узкое место |
+|---|---|---|---|---|
+| `gpt-oss-120b` или алиас `openai/gpt-oss-120b` | `gpt-oss-120b` | Groq `openai/gpt-oss-120b`; OVHcloud `gpt-oss-120b`; SambaNova `gpt-oss-120b`; OpenRouter `openai/gpt-oss-120b` | 131k | **Groq, 8000 TPM** |
+
+Контекст 131k — как у `gpt-oss-120b` в конфиге. Самое узкое место группы по токенам в минуту — Groq: `limits.tpm: 8000`. У OVHcloud, SambaNova и OpenRouter TPM в конфиге нет (у OVH без ключа 2 RPM, у SambaNova 200K токенов в сутки, у OpenRouter 20 RPM / 50 RPD). Оба клиентских имени есть в `GET /v1/models`.
+
+Модели отдельных провайдеров из таблицы «Провайдеры из коробки» — `glm-4.7-flash`, `nvidia/nemotron-3-super-120b-a12b:free`, `@cf/qwen/qwen3-30b-a3b-fp8`. Запрос с таким именем идёт к провайдерам, у которых оно задано.
+
 ### curl
 
 ```bash
@@ -223,26 +235,41 @@ curl -s localhost:4000/v1/models
 curl -s localhost:4000/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model":"gpt-oss-120b","messages":[{"role":"user","content":"Скажи привет"}]}'
 # то же самое: алиас группы, запрос разъедется по Groq / OVH / SambaNova / OpenRouter
-# -d '{"model":"openai/gpt-oss-120b",...}'
+# -d '{"model":"openai/gpt-oss-120b","messages":[{"role":"user","content":"Скажи привет"}]}'
 
-# стриминг
+# стриминг — алиас той же группы
 curl -N localhost:4000/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"model":"openai/coder","stream":true,"messages":[{"role":"user","content":"Перечисли три цвета радуги"}]}'
+  -d '{"model":"openai/gpt-oss-120b","stream":true,"messages":[{"role":"user","content":"Перечисли три цвета радуги"}]}'
 ```
 
 ### Aider
 
 ```bash
-aider --openai-api-base http://localhost:4000/v1 --openai-api-key dummy --model openai/coder
+aider --openai-api-base http://localhost:4000/v1 --openai-api-key dummy \
+  --model openai/gpt-oss-120b \
+  --model-settings-file .aider.model.settings.yml
 # без стриминга: добавить --no-stream
 ```
+
+Файл `.aider.model.settings.yml` — список объектов ([настройки моделей Aider](https://aider.chat/docs/config/adv-model-settings.html)). Поле `name` должно совпадать с `--model` (`openai/gpt-oss-120b`); иначе Aider не применит `extra_headers`:
+
+```yaml
+- name: openai/gpt-oss-120b
+  extra_params:
+    extra_headers:
+      x-run-id: "20261017-101500-42"
+      x-issue: "42"
+      x-client: aider
+```
+
+`extra_params` уходит в `litellm.completion()`, `extra_headers` — заголовками запроса. Шлюз пишет `x-run-id`, `x-issue` и `x-client` в `usage_record`.
 
 ### OpenHands
 
 В настройках LLM (Settings → LLM → Advanced) или через переменные окружения:
 
 ```bash
-LLM_MODEL=openai/coder
+LLM_MODEL=openai/gpt-oss-120b
 LLM_BASE_URL=http://host.docker.internal:4000/v1   # OpenHands в Docker; локально — http://localhost:4000/v1
 LLM_API_KEY=dummy
 ```
@@ -252,7 +279,7 @@ LLM_API_KEY=dummy
 ```python
 from openai import OpenAI
 client = OpenAI(base_url="http://localhost:4000/v1", api_key="dummy")
-print(client.chat.completions.create(model="openai/coder",
+print(client.chat.completions.create(model="openai/gpt-oss-120b",
       messages=[{"role": "user", "content": "Привет"}]).choices[0].message.content)
 ```
 
@@ -346,7 +373,7 @@ curl -s 'localhost:4000/stats/efficiency?days=30'
     tpm: 100000            # токенов в минуту
     tokens-per-day: 200000 # сутки по UTC
     tokens-per-month: 1000000
-  models: [gpt-oss-120b, Llama-4-Maverick-17B-128E-Instruct]   # дополнительные модели (кроме model)
+  models: [gpt-oss-120b]   # дополнительные id кроме поля model; только имена из конфига
   limits-probe: auto       # auto | groq | openrouter | gonka | models | none
 ```
 
@@ -483,10 +510,11 @@ gateway:
 
 Участнику группы уходит **ровно** его `model`. Запасной список OpenRouter (`models` из `fallback-models`) для такого
 вызова не отправляется, `route: fallback` снимается, а в тело OpenRouter добавляется
-`provider.allow_fallbacks: false` — иначе OpenRouter отвечает своей запасной моделью (nemotron, poolside/laguna, flint),
+`provider.allow_fallbacks: false` — иначе OpenRouter отвечает своей запасной моделью
+(`nvidia/nemotron-3-super-120b-a12b:free`, `google/gemma-4-31b-it:free`, `poolside/laguna-s-2.1:free`, `openrouter/free`),
 иногда ещё и не JSON. Ответ с другим полем `model` (или не-JSON до первого чанка стрима) — сбой этой попытки:
-провайдер в cooldown, запрос идёт следующему участнику. Суффикс варианта считается той же моделью
-(`openai/gpt-oss-120b:free` и `openai/gpt-oss-120b`). Прямой вызов OpenRouter не из группы по-прежнему шлёт `fallback-models`.
+провайдер в cooldown, запрос идёт следующему участнику. Суффикс `:free` у того же id (например у `openai/gpt-oss-120b`)
+считается той же моделью. Прямой вызов OpenRouter не из группы по-прежнему шлёт `fallback-models`.
 
 404 с текстом «unavailable» или «No endpoints found» помечает участника недоступным **в этой группе** на
 `gateway.model-unavailable-cooldown` (по умолчанию 10 минут). Следующие запросы группы его не вызывают, даже если
@@ -494,6 +522,7 @@ gateway:
 провайдера. Вне группы 404 «unavailable» клиенту, без этой паузы.
 
 Что слать Nori: **`gpt-oss-120b`** или алиас **`openai/gpt-oss-120b`**. Оба имени есть в `GET /v1/models`.
+Таблица провайдеров группы и лимит — в «Подключение клиентов»: самое узкое место по TPM — Groq, 8000.
 Неизвестная модель по-прежнему означает «все провайдеры», но обычный 404 тогда не вызывает failover —
 для всплеска нужно имя группы.
 
