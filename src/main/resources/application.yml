@@ -186,7 +186,7 @@ gateway:
     # ВНИМАНИЕ: с 2026-08 SambaCloud требует карту даже для Free-плана — аккаунт без карты получает
     # 402 PAYMENT_METHOD_REQUIRED (проверено 2026-10-17 на всех моделях). 402 считается retriable:
     # cooldown + failover на следующего провайдера, так что без карты провайдер просто «пропускается».
-    # Поэтому стоит последним (priority 7), пока к аккаунту не привязана карта.
+    # Поэтому priority 7 (после бесплатных и keyless), пока к аккаунту не привязана карта.
     # Заголовки лимитов: x-ratelimit-*-requests (минута) и x-ratelimit-*-requests-day (сутки).
     - name: sambanova
       base-url: https://api.sambanova.ai/v1
@@ -199,18 +199,37 @@ gateway:
         rpm: 20
         rpd: 20
         tokens-per-day: 200000
-    # Gonka Broker (пример, выключен): лимиты берутся из GET /test-auth (maxRpm), квота ~1M токенов в месяц.
-    # Если /test-auth лежит не под base-url — укажите полный адрес в limits-probe-url.
-    # - name: gonka
-    #   base-url: https://<broker>/v1
-    #   api-key: ${GONKA_API_KEY:}
-    #   model: <model>
-    #   priority: 8
-    #   limits-probe: gonka
-    #   limits-probe-url: https://<broker>/test-auth
-    #   limits:
-    #     rpm: 6
-    #     tokens-per-month: 1000000
+    # Gonka Broker: OpenAI-совместимый прокси (https://docs.gonkabroker.com/reference/api-compatibility/).
+    # Включается только при непустом GONKA_API_KEY. Ключ и адрес читаются из окружения, в репозиторий не пишутся.
+    # GONKA_BASE_URL — base-url; если переменная не задана, берётся публичный прокси.
+    # limits-probe: gonka → GET {origin}/test-auth (maxRpm). origin — base-url без хвоста /v1.
+    # Другой адрес опроса — GONKA_LIMITS_PROBE_URL. Другая модель — GONKA_MODEL.
+    # deepseek-ai/DeepSeek-V4-Flash-0731: context_length 400000 (публичный GET /v1/models, 2026-11-06),
+    # рассуждения по умолчанию выключены. rpm/tpm/месяц — запас, пока /test-auth не сообщил свои.
+    - name: gonka
+      base-url: "${GONKA_BASE_URL:https://proxy.gonkabroker.com/v1}"
+      api-key: ${GONKA_API_KEY:}
+      model: ${GONKA_MODEL:deepseek-ai/DeepSeek-V4-Flash-0731}
+      priority: 8
+      timeout: 60s
+      limits-probe: gonka
+      limits-probe-url: ${GONKA_LIMITS_PROBE_URL:}
+      limits:
+        rpm: 6
+        tpm: 100000
+        tokens-per-month: 1000000
+    # Google AI Gemini, OpenAI-совместимый эндпоинт (https://ai.google.dev/gemini-api/docs/openai).
+    # gemini-2.5-pro — окно 1 048 576 токенов. Без GEMINI_API_KEY провайдер пропускается.
+    # rpm/tpm ниже — запасной free-tier, пока ответ не прислал свои x-ratelimit-*.
+    - name: gemini
+      base-url: https://generativelanguage.googleapis.com/v1beta/openai
+      api-key: ${GEMINI_API_KEY:}
+      model: gemini-2.5-pro
+      priority: 9
+      timeout: 60s
+      limits:
+        rpm: 5
+        tpm: 250000
 
   # Логические модели: одно имя клиента → несколько провайдеров, каждому свой model id.
   # Клиент (Nori и др.) шлёт name или alias. Шлюз переписывает model и в режиме headroom
@@ -222,6 +241,7 @@ gateway:
   # provider.allow_fallbacks=false и без route=fallback. Если в ответе model другая
   # (nemotron, laguna, flint) или стрим начался не с JSON — попытка сбойная, берём следующего.
   # Таймаут участника держите заметно ниже клиентского (по умолчанию 30s при клиенте ~120s).
+  # large-context — отдельная группа для длинного контекста, без Groq; свой tpm-limit.
   model-groups:
     - name: gpt-oss-120b
       aliases:
@@ -238,6 +258,24 @@ gateway:
         # 404 «unavailable» / «No endpoints found» — участник выключается в группе на model-unavailable-cooldown.
         - provider: openrouter
           model: openai/gpt-oss-120b
+    # Крупные задачи (больше 1–3 файлов, порядка 30k токенов). Groq сюда не входит: у него limits.tpm 8000,
+    # и такой запрос ему не помещается. tpm-limit — собственный потолок группы: больше него — 413,
+    # до провайдеров запрос не доходит. ai-runner выбирает группу настройкой modelLarge=large-context.
+    - name: large-context
+      tpm-limit: 100000
+      members:
+        - provider: gonka
+          model: ${GONKA_MODEL:deepseek-ai/DeepSeek-V4-Flash-0731}
+        - provider: gemini
+          model: gemini-2.5-pro
+        - provider: kilo
+          model: nvidia/nemotron-3-super-120b-a12b:free
+        - provider: ovh
+          model: gpt-oss-120b
+        - provider: openrouter
+          model: nvidia/nemotron-3-super-120b-a12b:free
+        - provider: sambanova
+          model: gpt-oss-120b
 
   # Дашборд «Эффективность» (/efficiency.html, GET /stats/efficiency): откуда брать итоги прогонов ai-runner.
   # Необязательно: если spring-runner не запущен, страница покажет только данные шлюза. Пусто — не спрашивать.

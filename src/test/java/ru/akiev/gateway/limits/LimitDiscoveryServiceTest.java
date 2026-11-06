@@ -193,6 +193,24 @@ class LimitDiscoveryServiceTest {
     }
 
     @Test
+    void gonkaProbeHitsTestAuthBesideV1AndKeepsProvider() throws Exception {
+        good.enqueue(new MockResponse().setHeader("Content-Type", "application/json")
+                .setBody("{\"ok\":true,\"settings\":{\"maxRpm\":6}}"));
+        var gonka = new ProviderProperties("gonka", good.url("/v1").toString(), "gonka-test-key",
+                "deepseek-ai/DeepSeek-V4-Flash-0731", 8, Duration.ofSeconds(5),
+                new ProviderProperties.Limits(6, null, 100_000, null, 1_000_000L), true, "/models",
+                List.of(), null, false, null, "gonka", "");
+        assertThat(ProviderProber.gonkaProbeUrl(gonka)).endsWith("/test-auth").doesNotContain("/v1/");
+        var s = service(List.of(gonka));
+        s.afterSingletonsInstantiated();
+        assertThat(good.takeRequest().getPath()).isEqualTo("/test-auth");
+        assertThat(good.getRequestCount()).isEqualTo(1);
+        var state = byName(s, "gonka").state();
+        assertThat(state.excluded()).isFalse();
+        assertThat(state.effectiveLimits().rpm()).isEqualTo(new EffectiveLimits.LimitValue(6L, LimitSource.API));
+    }
+
+    @Test
     void openRouterProbeCallsKeyEndpoint() throws Exception {
         good.enqueue(new MockResponse().setHeader("Content-Type", "application/json")
                 .setBody("{\"data\":{\"is_free_tier\":true}}"));
