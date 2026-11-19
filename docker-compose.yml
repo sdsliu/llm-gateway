@@ -11,7 +11,8 @@ services:
       POSTGRES_USER: ${DB_USER:-gateway}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-gateway}
     ports:
-      - "${DB_PORT:-5432}:5432"
+      # Хост 5433, чтобы не занимать 5432 (Postgres word-focus). В контейнере порт остаётся 5432.
+      - "${DB_PORT:-5433}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:

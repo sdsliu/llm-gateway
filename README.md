@@ -78,15 +78,20 @@ open http://localhost:4000/     # дашборд
 docker compose down             # остановить (down -v — удалить и данные БД)
 ```
 
+Postgres публикуется на хосте как **5433** (`5433:5432`). Внутри сети compose база остаётся на 5432,
+а 5432 на хосте занимает word-focus. Если `.env` скопирован раньше и в нём `DB_PORT=5432`, замените порт на `5433`.
+Дашборд и API шлюза по-прежнему на `http://localhost:4000`.
+
 Если в вашей среде контейнеры в bridge-сети не видят друг друга, используйте host-сеть:
-`docker compose -f docker-compose.yml -f docker-compose.hostnet.yml up -d --build`.
+`docker compose -f docker-compose.yml -f docker-compose.hostnet.yml up -d --build`
+(в этом режиме Postgres слушает 5433 напрямую, без проброса).
 
 ### Вариант 2: локально (JDK 21), база в Docker
 
 ```bash
-docker compose up -d postgres
+docker compose up -d postgres   # на хосте localhost:5433, в контейнере 5432
 export GROQ_API_KEY=gsk_...
-./mvnw spring-boot:run          # http://localhost:4000
+./mvnw spring-boot:run          # http://localhost:4000, база jdbc:postgresql://localhost:5433/gateway
 ```
 
 ## Дашборд: здоровье, модели, квоты
@@ -133,9 +138,9 @@ Ping по расписанию: `gateway.health.scheduled=true` (интерва�
 | `GONKA_LIMITS_PROBE_URL` | рядом с base-url, `GET /test-auth` без хвоста `/v1` | полный URL опроса лимитов, если он не выводится из `GONKA_BASE_URL` |
 | `GONKA_MODEL` | `deepseek-ai/DeepSeek-V4-Flash-0731` | model id Gonka (контекст 400000) и тот же id в группе `large-context` |
 | `GEMINI_API_KEY` | — | ключ Google AI Gemini; пусто → провайдер пропускается |
-| `DB_URL` | `jdbc:postgresql://localhost:5432/gateway` | JDBC URL |
+| `DB_URL` | `jdbc:postgresql://localhost:5433/gateway` | JDBC URL для запуска шлюза на хосте. В compose подменяется на `postgres:5432` |
 | `DB_USER` / `DB_PASSWORD` | `gateway` / `gateway` | учётные данные БД |
-| `DB_NAME`, `DB_PORT`, `GATEWAY_PORT` | `gateway`, `5432`, `4000` | только для docker compose |
+| `DB_NAME`, `DB_PORT`, `GATEWAY_PORT` | `gateway`, `5433`, `4000` | только для docker compose. `DB_PORT` — порт на хосте; в контейнере Postgres слушает 5432 |
 
 ## Конфигурация провайдеров
 
