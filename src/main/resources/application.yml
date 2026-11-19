@@ -9,7 +9,8 @@ spring:
     serialization:
       write-dates-as-timestamps: false
   datasource:
-    url: ${DB_URL:jdbc:postgresql://localhost:5432/gateway}
+    # Хост 5433 — порт, который публикует docker compose. В сети compose DB_URL указывает на postgres:5432.
+    url: ${DB_URL:jdbc:postgresql://localhost:5433/gateway}
     username: ${DB_USER:gateway}
     password: ${DB_PASSWORD:gateway}
   jpa:
